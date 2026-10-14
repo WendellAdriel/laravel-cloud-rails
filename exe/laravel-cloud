@@ -1,0 +1,7 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+require "laravel_cloud"
+require "laravel_cloud/cli"
+
+exit LaravelCloud::CLI.new(ARGV).run
