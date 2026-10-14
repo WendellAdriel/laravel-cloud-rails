@@ -37,6 +37,9 @@ module LaravelCloud
       MAX_EXCEPTION_BYTES = 4000
       MAX_PAYLOAD_DATA_BYTES = 2000
 
+      # Laravel caps the one-line exception preview at 1001 characters.
+      MAX_EXCEPTION_PREVIEW_CHARS = 1001
+
       def initialize(events)
         @events = events
       end
@@ -60,6 +63,11 @@ module LaravelCloud
       # A terminal failure is reported twice: as a "failed" lifecycle event, and
       # as a failed job carrying the payload and exception so it can be
       # inspected from the Laravel Cloud dashboard.
+      #
+      # The "failed_job" fields are exactly those of Laravel's Cloud
+      # FailedJobProvider::log — the dashboard's failed-job list is built from
+      # them, so none may be left out (including "job_name" and
+      # "exception_preview", which the dashboard lists failed jobs by).
       def failed(delivery, error, started_at, finished_at)
         emit_queue_event("failed", delivery.queue, finished_at, "duration_ms" => duration_ms(started_at, finished_at))
 
@@ -71,6 +79,8 @@ module LaravelCloud
           # SQS's ApproximateReceiveCount, mirroring Laravel's SqsJob::attempts().
           "attempts" => delivery.receive_count,
           "payload" => trim_payload(delivery.body),
+          "exception_preview" => preview(error),
+          "job_name" => job_name(delivery.body),
           "exception" => truncate(describe(error), MAX_EXCEPTION_BYTES),
         )
       end
@@ -109,6 +119,25 @@ module LaravelCloud
 
       def duration_ms(started_at, finished_at)
         [((finished_at - started_at) * 1000).round, 0].max
+      end
+
+      # Laravel's one-line preview: "Class: message in file:line", or
+      # "Class in file:line" when there's no message.
+      def preview(error)
+        location = error.backtrace_locations&.first
+        where = location ? " in #{location.absolute_path || location.path}:#{location.lineno}" : ""
+        message = error.message.to_s
+
+        line = message.empty? ? "#{error.class}#{where}" : "#{error.class}: #{message}#{where}"
+        line.scrub[0, MAX_EXCEPTION_PREVIEW_CHARS]
+      end
+
+      # The payload's "displayName", as Laravel reads it; "" if there isn't one.
+      def job_name(body)
+        payload = JSON.parse(body.to_s)
+        payload.is_a?(Hash) ? payload["displayName"].to_s : ""
+      rescue JSON::ParserError
+        ""
       end
 
       # The exception led by "Class: message", then its backtrace — the shape

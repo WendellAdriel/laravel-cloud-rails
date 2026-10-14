@@ -118,11 +118,23 @@ with 0 delay. The abandoned delivery counts as an attempt.
 
 ### Failed-job retry
 
-Cloud hands `queue:retry` an https URL whose body is the `failed_job` event,
-encrypted with `APP_KEY` (Laravel's Encrypter format; CBC+HMAC or GCM, read
-from the payload). The payload is pushed back verbatim (fresh receive count)
-and a `failed_job` event with `retried_at` is emitted. Payloads trimmed by the
-collector workaround (`data_truncated`) are refused, not pushed.
+A port of Laravel 13's `Cloud\FailedJobProvider::find`/`forget` plus the
+`queue:retry` loop. `FailedJobRetrier` GETs the URL Cloud hands over with
+`Cloud-Payload-Version: 1` and `Cloud-Encryption-Cipher` (`AES-256-CBC` for a
+32-byte key), using Laravel's retry policy (10 attempts, 500ms·2ⁿ backoff, no
+retry on 403). It decrypts the body with `APP_KEY` (Laravel's Encrypter
+format; CBC+HMAC or GCM, read from the payload). A version-1 response is a page
+`{data: [failed jobs], links: {self, next}}` and the retrier follows `next`; an
+unversioned response is one failed job (legacy). For each job the payload is
+pushed back verbatim (fresh receive count), and only then is a `failed_job`
+event with `retried_at` emitted for that job's `id`. A push failure raises and
+stops the run, as in Laravel. Payloads trimmed by the collector workaround
+(`data_truncated`) are skipped and left in the dashboard rather than aborting
+the batch, which is our only deliberate departure from Laravel.
+
+The `failed_job` event the worker emits carries exactly the fields of
+`FailedJobProvider::log`, including `job_name` and `exception_preview`; the
+dashboard needs them. `worker_test.rb` pins the field list.
 
 ### Observability
 

@@ -7,7 +7,7 @@ module LaravelCloud
   # app's queue workers and failed-job retries:
   #
   #   laravel-cloud queue:work [options]
-  #   laravel-cloud queue:retry <failed-job-url>
+  #   laravel-cloud queue:retry <failed-job-url>...
   #
   # Run from the application root (`bundle exec laravel-cloud ...`): it boots
   # the app from config/environment.rb, as `bin/rails runner` would.
@@ -73,19 +73,36 @@ module LaravelCloud
       0
     end
 
+    # Mirrors Laravel's queue:retry: each URL may yield many failed jobs, each
+    # reported as it's retried. Exits 1 if any job was skipped.
     def retry_failed_job
-      url = @argv.shift
+      urls = @argv.reject(&:empty?)
 
-      if url.nil? || url.empty?
-        @err.puts("Usage: laravel-cloud queue:retry <failed-job-url>")
+      if urls.empty?
+        @err.puts("Usage: laravel-cloud queue:retry <failed-job-url>...")
         return 1
       end
 
       boot_app
 
-      failed_job = Queue::FailedJobRetrier.new.retry(url)
-      @out.puts("[LaravelCloud] Retried failed job #{failed_job['id']} on queue #{failed_job['queue']}")
-      0
+      @out.puts("Pushing failed queue jobs back onto the queue.")
+      retrier = Queue::FailedJobRetrier.new
+      skipped = 0
+
+      urls.each do |url|
+        results = retrier.retry(url) do |result|
+          if result.retried?
+            @out.puts("  #{result.id} (#{result.queue}) DONE")
+          else
+            skipped += 1
+            @err.puts("  #{result.id} (#{result.queue}) SKIPPED: can't be retried, #{result.error}")
+          end
+        end
+
+        @err.puts("Unable to find any failed jobs with ID [#{url}].") if results.empty?
+      end
+
+      skipped.zero? ? 0 : 1
     end
 
     def boot_app
@@ -110,7 +127,7 @@ module LaravelCloud
 
         Commands:
           queue:work                 Process Laravel Cloud managed queue jobs (--help for options)
-          queue:retry <url>          Retry a failed job handed over by Laravel Cloud
+          queue:retry <url>...       Retry the failed jobs Laravel Cloud hands over
       USAGE
     end
   end

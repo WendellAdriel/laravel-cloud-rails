@@ -27,6 +27,14 @@ module LaravelCloud
         raise ArgumentError, "The application key must be 16 or 32 bytes." unless KEY_SIZES.include?(@key.bytesize)
       end
 
+      # The cipher this key implies, spelled as Laravel's `app.cipher` — what
+      # Laravel sends Cloud in the Cloud-Encryption-Cipher header. Laravel's
+      # default is AES-256-CBC, which a 32-byte key (any `php artisan
+      # key:generate` key) gives.
+      def cipher
+        "AES-#{@key.bytesize * 8}-CBC"
+      end
+
       # Encrypter::encryptString. (Laravel Cloud does the encrypting in
       # practice; this exists so tests can produce real payloads.)
       def encrypt_string(value, gcm: false)

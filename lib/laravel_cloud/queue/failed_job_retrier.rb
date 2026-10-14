@@ -6,96 +6,207 @@ require "uri"
 
 module LaravelCloud
   module Queue
-    # Retries a failed job from the Laravel Cloud dashboard — what
+    # Retries failed jobs from the Laravel Cloud dashboard — what
     # `laravel-cloud queue:retry <url>` runs.
     #
     # Laravel Cloud keeps failed jobs (the "failed_job" events the worker
-    # emits) outside the app. To retry one it hands over an https:// URL whose
-    # body is that failed job, encrypted with the application key. Mirroring
-    # Laravel's Cloud FailedJobProvider: fetch, decrypt, push the original
-    # payload back onto its queue, and emit a "failed_job" event carrying
-    # "retried_at" so the dashboard marks it retried.
+    # emits) outside the app, and hands the retry command an https:// URL to
+    # fetch them from. This is a port of Laravel's Cloud FailedJobProvider
+    # (find / forget) plus the queue:retry loop around it:
+    #
+    #   1. GET the URL, asking for payload version 1 and naming our cipher.
+    #   2. Decrypt the body with the application key. Version 1 is a page —
+    #      { data: [failed jobs], links: { self, next } } — and an unversioned
+    #      response is a single failed job (the legacy format).
+    #   3. For each failed job: push its payload back onto its queue, then emit
+    #      a "failed_job" event with "retried_at" so the dashboard marks it
+    #      retried. When a page runs out, follow links.next.
     class FailedJobRetrier
       class Error < LaravelCloud::Error; end
 
-      FETCH_ATTEMPTS = 3
-      FETCH_ERRORS = [SystemCallError, SocketError, IOError, Timeout::Error, OpenSSL::SSL::SSLError].freeze
+      PAYLOAD_VERSION = "1"
 
-      # `fetcher` returns the encrypted body for a URL; overridable for tests.
-      def initialize(runtime: Queue.runtime, app_key: ENV["APP_KEY"], fetcher: nil)
-        @runtime = runtime
-        @app_key = app_key
-        @fetcher = fetcher || method(:fetch)
+      # Laravel's Http::retry(10, ...) policy: up to 10 attempts, backing off
+      # 500ms * 2^(attempt - 1) between them, and never retrying a 403 (an
+      # expired or invalid signed URL won't get better).
+      FETCH_ATTEMPTS = 10
+      FETCH_TIMEOUT = 10
+      FETCH_ERRORS = [SystemCallError, SocketError, IOError, Timeout::Error, OpenSSL::SSL::SSLError, EOFError].freeze
+
+      # An HTTP response, reduced to what the retrier reads.
+      Response = Struct.new(:status, :headers, :body) do
+        def header(name)
+          headers.find { |key, _| key.casecmp?(name) }&.last.to_s
+        end
       end
 
-      # Returns the failed job that was retried.
+      # The outcome of one failed job: retried, or skipped (left in the
+      # dashboard) with the reason.
+      Result = Struct.new(:id, :queue, :error) do
+        def retried?
+          error.nil?
+        end
+      end
+
+      # `fetcher` takes (url, headers) and returns a Response; `sleeper` takes
+      # seconds. Both are overridable for tests.
+      def initialize(runtime: Queue.runtime, app_key: ENV["APP_KEY"], fetcher: nil, sleeper: nil)
+        @runtime = runtime
+        @app_key = app_key
+        @fetcher = fetcher || method(:http_get)
+        @sleeper = sleeper || ->(seconds) { sleep(seconds) }
+      end
+
+      # Retry every failed job the URL yields, calling the block with each
+      # Result as it happens. Returns the Results.
+      #
+      # A failed job whose payload can't be rebuilt is skipped and stays in the
+      # dashboard. Anything else going wrong — the fetch, decryption, a push —
+      # raises Error, as Laravel's queue:retry stops at the first failure. Jobs
+      # already retried stay retried; the one that failed isn't marked.
       def retry(url)
         raise Error, "Failed job URLs must start with https://." unless url.to_s.start_with?("https://")
         raise Error, "An APP_KEY is required to decrypt failed jobs." if @app_key.to_s.empty?
 
-        failed_job = decrypt(@fetcher.call(url))
-        ensure_runnable!(failed_job)
+        encrypter = encrypter_for(@app_key)
+        results = []
 
-        # Pushed verbatim: the payload is the message body exactly as it was
-        # first queued, so the job starts over with a fresh delivery count.
-        @runtime.dispatcher.push_body(failed_job["queue"], failed_job["payload"])
+        each_failed_job(url, encrypter) do |failed_job|
+          result = retry_failed_job(failed_job)
+          results << result
+          yield result if block_given?
+        end
 
-        @runtime.observer.retried(failed_job["id"], failed_job["queue"])
-
-        failed_job
+        results
       end
 
       private
 
-      def decrypt(body)
-        failed_job = JSON.parse(LaravelEncrypter.new(@app_key).decrypt_string(body))
+      def retry_failed_job(failed_job)
+        id = failed_job["id"].to_s
+        queue = failed_job["queue"]
+        payload = failed_job["payload"]
 
-        unless failed_job.is_a?(Hash) && failed_job["payload"].is_a?(String) && failed_job["queue"].is_a?(String)
-          raise Error, "The failed job is missing its queue or payload."
+        unless queue.is_a?(String) && payload.is_a?(String)
+          raise Error, "The failed job #{id} is missing its queue or payload."
         end
 
-        failed_job
-      rescue JSON::ParserError
-        raise Error, "The failed job is not valid JSON."
-      rescue LaravelEncrypter::DecryptError, ArgumentError => e
-        raise Error, "Unable to decrypt the failed job: #{e.message}"
+        unrebuildable = unrebuildable_reason(payload)
+        return Result.new(id, queue, unrebuildable) if unrebuildable
+
+        # Pushed verbatim: the payload is the message body exactly as it was
+        # first queued, so the job starts over with a fresh delivery count.
+        begin
+          @runtime.dispatcher.push_body(queue, payload)
+        rescue StandardError => e
+          raise Error, "Unable to push the failed job #{id} back onto \"#{queue}\": #{e.message}"
+        end
+
+        # FailedJobProvider::forget — only once the push has succeeded.
+        @runtime.observer.retried(id, queue)
+
+        Result.new(id, queue, nil)
       end
 
       # A payload trimmed for the log collector's line limit (see Observer) no
-      # longer holds the whole job, so it can't be rebuilt. Refuse rather than
-      # push a message that can only fail again as undecodable.
-      def ensure_runnable!(failed_job)
-        payload = JSON.parse(failed_job["payload"])
+      # longer holds the whole job, so it can't be rebuilt; pushing it would
+      # only fail again as undecodable.
+      def unrebuildable_reason(payload)
+        decoded = JSON.parse(payload)
 
-        if payload.is_a?(Hash) && payload["data_truncated"]
-          raise Error, "The failed job #{failed_job['id']} can't be retried: its payload was too large to be kept whole."
-        end
+        return "its payload was too large to be kept whole" if decoded.is_a?(Hash) && decoded["data_truncated"]
 
-        Message.decode(failed_job["payload"])
+        Message.decode(payload)
+        nil
       rescue JSON::ParserError, Message::Undecodable
-        raise Error, "The failed job #{failed_job['id']} can't be retried: its payload is not a managed queue job."
+        "its payload is not a managed queue job"
       end
 
-      def fetch(url)
-        uri = URI.parse(url)
-        attempts = 0
+      # FailedJobProvider::failedJobsIterator: yield each failed job, fetching
+      # the next page only once the current one is used up.
+      def each_failed_job(url, encrypter)
+        page = fetch_page(url, encrypter)
 
-        begin
-          attempts += 1
+        loop do
+          page[:data].each { |failed_job| yield failed_job }
 
-          response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 10, read_timeout: 10) do |http|
-            http.request(Net::HTTP::Get.new(uri))
-          end
-        rescue *FETCH_ERRORS => e
-          raise Error, "Unable to fetch the failed job: #{e.message}" if attempts >= FETCH_ATTEMPTS
+          break if page[:next].nil?
 
-          sleep 1
-          retry
+          page = fetch_page(page[:next], encrypter)
         end
+      end
 
-        raise Error, "Unable to fetch the failed job (HTTP #{response.code})." unless response.is_a?(Net::HTTPSuccess)
+      # FailedJobProvider::resolveFailedJobsPayload.
+      def fetch_page(url, encrypter)
+        response = fetch(url, encrypter.cipher)
+        payload = decrypt(response.body, encrypter)
 
-        response.body
+        case response.header("Cloud-Payload-Version")
+        when PAYLOAD_VERSION
+          data = payload.is_a?(Hash) ? payload["data"] : nil
+          links = payload.is_a?(Hash) && payload["links"].is_a?(Hash) ? payload["links"] : {}
+          raise Error, "The failed jobs page is missing its data." unless data.is_a?(Array)
+
+          { data: data, next: presence(links["next"]) }
+        when ""
+          { data: [payload], next: nil }
+        else
+          raise Error, "Unsupported payload version: #{response.header('Cloud-Payload-Version')}"
+        end
+      end
+
+      def decrypt(body, encrypter)
+        JSON.parse(encrypter.decrypt_string(body))
+      rescue JSON::ParserError
+        raise Error, "The failed jobs payload is not valid JSON."
+      rescue LaravelEncrypter::DecryptError => e
+        raise Error, "Unable to decrypt the failed jobs: #{e.message}"
+      end
+
+      # FailedJobProvider::fetchFailedJobs, with Laravel's retry policy.
+      def fetch(url, cipher)
+        headers = { "Cloud-Payload-Version" => PAYLOAD_VERSION, "Cloud-Encryption-Cipher" => cipher }
+        attempt = 0
+
+        loop do
+          attempt += 1
+
+          begin
+            response = @fetcher.call(url, headers)
+          rescue *FETCH_ERRORS => e
+            raise Error, "Unable to fetch the failed jobs: #{e.message}" if attempt >= FETCH_ATTEMPTS
+          else
+            return response if (200..299).cover?(response.status)
+
+            if response.status == 403 || attempt >= FETCH_ATTEMPTS
+              raise Error, "Unable to fetch the failed jobs (HTTP #{response.status})."
+            end
+          end
+
+          @sleeper.call(0.5 * (2**(attempt - 1)))
+        end
+      end
+
+      def http_get(url, headers)
+        uri = URI.parse(url)
+
+        Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: FETCH_TIMEOUT, read_timeout: FETCH_TIMEOUT) do |http|
+          request = Net::HTTP::Get.new(uri)
+          headers.each { |name, value| request[name] = value }
+
+          response = http.request(request)
+          Response.new(response.code.to_i, response.each_header.to_a, response.body.to_s)
+        end
+      end
+
+      def encrypter_for(app_key)
+        LaravelEncrypter.new(app_key)
+      rescue ArgumentError => e
+        raise Error, "The APP_KEY can't be used to decrypt failed jobs: #{e.message}"
+      end
+
+      def presence(value)
+        value.is_a?(String) && !value.empty? ? value : nil
       end
     end
   end

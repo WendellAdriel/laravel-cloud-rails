@@ -183,12 +183,17 @@ defined in the worker's code is retried as usual, since a rolling deploy may
 not have reached that worker yet. Messages that can't be decoded at all are
 deleted and logged.
 
-**Retrying from the dashboard.** Retrying a failed job in Laravel Cloud runs
-`laravel-cloud queue:retry <url>`. It decrypts the failed job with `APP_KEY`
-and puts the original message back on its queue, with a fresh attempt count.
+**Retrying from the dashboard.** Retrying failed jobs in Laravel Cloud runs
+`laravel-cloud queue:retry <url>`, the same flow as Laravel's `queue:retry`. It
+fetches the failed jobs from the URL (following pages when there are many),
+decrypts them with `APP_KEY`, and puts each original message back on its queue
+with a fresh attempt count. Each job is marked retried in the dashboard once
+it's back on the queue. The first fetch, decryption or push error stops the
+run; jobs already retried stay retried.
+
 The dashboard keeps job data of up to about 2 KB per failed job. A job with
-more data than that can't be rebuilt from the dashboard, so retrying it fails
-with an error instead of queueing an incomplete job.
+more data than that can't be rebuilt, so it's skipped and left in the
+dashboard, and the command exits `1`.
 
 ### Running workers
 
@@ -266,7 +271,7 @@ bundle exec laravel-cloud queue:work --queue critical,default --stop-when-empty
 | Command | Description |
 | --- | --- |
 | `laravel-cloud queue:work [options]` | Run a worker (see [Running workers](#running-workers)). |
-| `laravel-cloud queue:retry <url>` | Retry a failed job from the Laravel Cloud dashboard. |
+| `laravel-cloud queue:retry <url>...` | Retry failed jobs from the Laravel Cloud dashboard. |
 
 #### Environment variables
 
@@ -277,7 +282,7 @@ Laravel Cloud sets these; you only set them yourself when running outside Cloud.
 | `LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG` | Queue locations, region, credentials mode and agent settings (JSON). |
 | `LARAVEL_CLOUD_AGENT_SOCKET` | Agent socket path, if the config doesn't give one. Default `/tmp/cloud-agent.sock`. |
 | `LARAVEL_CLOUD_LOG_SOCKET` | Where dashboard events are sent. Default `unix:///tmp/cloud-init.sock`. |
-| `APP_KEY` | Decrypts failed jobs for `queue:retry`. |
+| `APP_KEY` | Decrypts failed jobs for `queue:retry`. A Laravel-style key (`base64:...`, 32 bytes for AES-256-CBC). |
 
 #### Errors
 

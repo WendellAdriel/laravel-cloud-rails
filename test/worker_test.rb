@@ -101,6 +101,10 @@ class WorkerTest < Minitest::Test
     assert_equal %w[queued started released started released started failed], @events.queue_events.map(&:first)
 
     failed = @events.failed_jobs.sole
+    assert_equal %w[_cloud_event id queue started_at attempts payload exception_preview job_name exception], failed.keys,
+                 "the failed_job event must carry exactly Laravel's FailedJobProvider fields"
+    assert_equal "WorkerTest::FlakyJob", failed["job_name"]
+    assert_match(/\AWorkerTest::Flaky: attempt 3 in \/.+worker_test\.rb:\d+\z/, failed["exception_preview"])
     assert_equal "default", failed["queue"]
     assert_equal 3, failed["attempts"]
     assert_match(/WorkerTest::Flaky/, failed["exception"])
