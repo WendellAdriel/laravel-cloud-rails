@@ -68,12 +68,13 @@ module LaravelCloud
       # FailedJobProvider::log — the dashboard's failed-job list is built from
       # them, so none may be left out (including "job_name" and
       # "exception_preview", which the dashboard lists failed jobs by).
+      #
+      # The order follows FailedJobProvider::log too: the failed job first,
+      # then the "failed" lifecycle event (its finishProcessingJob call).
       def failed(delivery, error, started_at, finished_at)
-        emit_queue_event("failed", delivery.queue, finished_at, "duration_ms" => duration_ms(started_at, finished_at))
-
         @events.emit(
           "_cloud_event" => "failed_job",
-          "id" => SecureRandom.uuid,
+          "id" => uuid7(finished_at),
           "queue" => delivery.queue,
           "started_at" => format_time(started_at),
           # SQS's ApproximateReceiveCount, mirroring Laravel's SqsJob::attempts().
@@ -83,6 +84,8 @@ module LaravelCloud
           "job_name" => job_name(delivery.body),
           "exception" => truncate(describe(error), MAX_EXCEPTION_BYTES),
         )
+
+        emit_queue_event("failed", delivery.queue, finished_at, "duration_ms" => duration_ms(started_at, finished_at))
       end
 
       # A failed job retried from the dashboard: the same "failed_job" channel,
@@ -113,6 +116,20 @@ module LaravelCloud
         }.merge(extra))
       end
 
+      # A time-ordered UUIDv7 for `time`, as Laravel's Str::uuid7($timestamp)
+      # gives a failed job's id: 48 bits of Unix milliseconds, then the version
+      # and variant bits around random data (RFC 9562).
+      def uuid7(time)
+        milliseconds = (time.to_r * 1000).to_i
+        bytes = [milliseconds >> 16, milliseconds & 0xFFFF].pack("Nn") + SecureRandom.random_bytes(10)
+
+        bytes.setbyte(6, (bytes.getbyte(6) & 0x0F) | 0x70)
+        bytes.setbyte(8, (bytes.getbyte(8) & 0x3F) | 0x80)
+
+        hex = bytes.unpack1("H*")
+        [hex[0, 8], hex[8, 4], hex[12, 4], hex[16, 4], hex[20, 12]].join("-")
+      end
+
       def format_time(time)
         time.utc.strftime("%Y-%m-%d %H:%M:%S.%6N")
       end
@@ -125,11 +142,11 @@ module LaravelCloud
       # "Class in file:line" when there's no message.
       def preview(error)
         location = error.backtrace_locations&.first
-        where = location ? " in #{location.absolute_path || location.path}:#{location.lineno}" : ""
-        message = error.message.to_s
+        where = location ? " in #{utf8(location.absolute_path || location.path)}:#{location.lineno}" : ""
+        message = utf8(error.message)
 
         line = message.empty? ? "#{error.class}#{where}" : "#{error.class}: #{message}#{where}"
-        line.scrub[0, MAX_EXCEPTION_PREVIEW_CHARS]
+        line[0, MAX_EXCEPTION_PREVIEW_CHARS]
       end
 
       # The payload's "displayName", as Laravel reads it; "" if there isn't one.
@@ -142,10 +159,18 @@ module LaravelCloud
 
       # The exception led by "Class: message", then its backtrace — the shape
       # of PHP's (string) $exception that Laravel and Symfony report, so the
-      # dashboard's first line reads the same. Scrubbed to valid UTF-8 so it
-      # can always be JSON-encoded.
+      # dashboard's first line reads the same.
       def describe(error)
-        ["#{error.class}: #{error.message}", *error.backtrace].join("\n").scrub
+        ["#{error.class}: #{utf8(error.message)}", *Array(error.backtrace).map { |line| utf8(line) }].join("\n")
+      end
+
+      # A job's exception can carry any bytes in any encoding (a binary message,
+      # a non-UTF-8 path). Reinterpret as UTF-8 with invalid bytes replaced by
+      # U+FFFD — PHP's JSON_INVALID_UTF8_SUBSTITUTE — before anything is built
+      # from it; mixing encodings would otherwise raise here, after the message
+      # is already deleted, and the failed job would never be reported.
+      def utf8(value)
+        value.to_s.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
       end
 
       # Shrink the failed-job payload to keep the event under the collector's

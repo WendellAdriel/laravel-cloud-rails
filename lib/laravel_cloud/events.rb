@@ -35,7 +35,7 @@ module LaravelCloud
     def emit_many(payloads)
       return if payloads.empty?
 
-      line = payloads.map { |payload| JSON.generate(payload) }.join("\n") << "\n"
+      line = payloads.map { |payload| JSON.generate(scrub(payload)) }.join("\n") << "\n"
 
       @mutex.synchronize do
         ensure_connected
@@ -46,6 +46,18 @@ module LaravelCloud
     end
 
     private
+
+    # Laravel encodes with JSON_INVALID_UTF8_SUBSTITUTE: a malformed byte
+    # becomes U+FFFD and the event still goes out. Ruby's JSON raises instead,
+    # which would silently drop the event, so substitute before encoding.
+    def scrub(value)
+      case value
+      when String then value.valid_encoding? && value.encoding == Encoding::UTF_8 ? value : value.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
+      when Hash then value.to_h { |key, item| [scrub(key), scrub(item)] }
+      when Array then value.map { |item| scrub(item) }
+      else value
+      end
+    end
 
     def write(line)
       @socket.write(line)

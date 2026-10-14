@@ -132,9 +132,18 @@ stops the run, as in Laravel. Payloads trimmed by the collector workaround
 (`data_truncated`) are skipped and left in the dashboard rather than aborting
 the batch, which is our only deliberate departure from Laravel.
 
-The `failed_job` event the worker emits carries exactly the fields of
-`FailedJobProvider::log`, including `job_name` and `exception_preview`; the
-dashboard needs them. `worker_test.rb` pins the field list.
+The `failed_job` event the worker emits matches `FailedJobProvider::log`
+(laravel/framework 13.x): exactly its fields, including `job_name` and
+`exception_preview`; a UUIDv7 `id`; and it's emitted *before* the `failed`
+lifecycle event. Exception text is coerced to valid UTF-8 (invalid bytes →
+U+FFFD, PHP's `JSON_INVALID_UTF8_SUBSTITUTE`) before anything is built from it,
+because a raise there happens after the message is deleted and would lose the
+failed job. `cloud_socket_test.rb` checks the real bytes on a real socket.
+
+Not ported: Laravel's optional `exception_id` on `failed_job`, which links to
+the separate Cloud Exceptions feature (`LARAVEL_CLOUD_EXCEPTIONS`,
+`Cloud\ExceptionReporter`). That belongs with an exceptions feature, if one is
+added.
 
 ### Observability
 
