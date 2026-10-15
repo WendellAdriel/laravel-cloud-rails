@@ -9,8 +9,10 @@ Laravel Cloud features for Ruby on Rails applications.
 
 ## Installation
 
+Install the gem from GitHub:
+
 ```bash
-bundle add rails-on-cloud
+bundle add rails-on-cloud --git https://github.com/laravel/rails-on-cloud.git
 ```
 
 ## Features
