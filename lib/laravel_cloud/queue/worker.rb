@@ -4,49 +4,33 @@ require "logger"
 
 module LaravelCloud
   module Queue
-    # Processes managed-queue jobs — what `laravel-cloud queue:work` runs.
-    #
-    # Active Job has no worker of its own, so this is the consumer half of the
-    # adapter. It receives one message at a time — from the in-container
-    # cloud-agent on Laravel Cloud, or straight from SQS locally — runs it
-    # through Active Job, and reports exactly one outcome per message:
+    # Runs managed-queue jobs (`laravel-cloud queue:work`). Receives one message
+    # at a time — from the Cloud agent, or straight from SQS without one — and
+    # reports exactly one outcome per message:
     #
     #   - success / discard        → delete              ("processed")
     #   - `retry_on` retrying      → visibility reset    ("released")
     #   - an exception, tries left → visibility reset    ("released")
     #   - an exception, no tries   → delete + failed job ("failed")
     #
-    # `tries` and `backoff` are Laravel's `queue:work` options. `tries` (default
-    # 1) is how many times a job that raises is attempted in all; with the
-    # default an escaping exception is terminal, as it is everywhere in Active
-    # Job, and retries are opted into per job with `retry_on`.
-    #
-    # `tries` also caps deliveries: a message delivered more times than its job
-    # may be attempted fails as MaxAttemptsExceeded without running. That stops
-    # a job that never finishes a delivery — one that crashes or hangs the
-    # worker — from coming back forever. A job's `retry_on` attempts raise its
-    # cap to match (see RetryAttempts), so the cap never cuts a retry short.
+    # `tries` / `backoff` are Laravel's `queue:work` options; the default of one
+    # try keeps Active Job's behaviour (an escaping exception is terminal).
+    # `tries` also caps deliveries, so a job that crashes the worker can't come
+    # back forever; a job's `retry_on` attempts raise its cap (RetryAttempts).
     class Worker
       # The message has been delivered more times than its job may be attempted.
       class MaxAttemptsExceeded < LaravelCloud::Error; end
 
-      # Raised into the worker thread to abandon a long-poll, or a job still
-      # running when the shutdown timeout lapses. An Exception (not a
-      # StandardError) so neither `retry_on` nor a job's own `rescue` treats it
-      # as a job failure.
+      # Raised into the worker thread to abandon a long-poll or an overrunning
+      # job at shutdown. Not a StandardError, so `retry_on` and a job's own
+      # `rescue` don't treat it as a failure.
       class Shutdown < Exception; end # rubocop:disable Lint/InheritException
 
       SIGNALS = %w[TERM INT].freeze
 
-      # - `queues`: the managed queues to poll on the SQS-direct path, in
-      #   order; empty means the environment's default queue. On Laravel Cloud
-      #   the agent is pinned to its queue and serves it regardless.
-      # - `tries` / `backoff`: see above. `backoff` is in seconds.
-      # - `max_jobs` / `max_time`: stop after that many jobs / seconds.
-      # - `shutdown_timeout`: seconds a running job gets to finish after a stop
-      #   is requested before it's abandoned and released for redelivery.
-      # - `stop_when_empty`: exit once a poll finds nothing — for draining a
-      #   queue locally or in CI.
+      # `queues` only applies without the agent, which is pinned to one queue.
+      # `shutdown_timeout` is how long a running job gets after a stop request
+      # before it's abandoned and released.
       def initialize(queues: [], tries: 1, backoff: 0, max_jobs: nil, max_time: nil, shutdown_timeout: 15,
                      stop_when_empty: false, runtime: Queue.runtime, logger: nil)
         @queues = queues
@@ -92,11 +76,9 @@ module LaravelCloud
         @logger.info("[LaravelCloud] Stopped processing managed queue jobs")
       end
 
-      # Finish the job in hand (within the shutdown timeout), then exit. When
-      # idle in a long-poll (up to ~55s against the agent) the poll is
-      # abandoned so shutdown isn't held up; a message that lands in the instant
-      # between the poll returning and this interrupt is simply never processed
-      # here, and SQS redelivers it once its visibility timeout lapses.
+      # Finish the current job, then exit. An idle long-poll (up to ~55s) is
+      # abandoned so shutdown isn't held up; a message received at that exact
+      # moment is redelivered by SQS after its visibility timeout.
       def stop
         @stop_requested_at ||= monotonic
         @thread.raise(Shutdown) if @polling && @thread
@@ -106,7 +88,6 @@ module LaravelCloud
         !@stop_requested_at.nil?
       end
 
-      # Run one received message through Active Job and report its outcome.
       def process(delivery)
         job_data = begin
           Message.decode(delivery.body, receive_count: delivery.receive_count)
@@ -127,9 +108,8 @@ module LaravelCloud
           enforce_max_attempts!(delivery, job_class)
           execute(delivery, job_data)
         rescue Shutdown
-          # Abandoned at shutdown: hand it straight back so another worker can
-          # pick it up now, rather than after its visibility timeout. Like a
-          # killed Laravel job, the abandoned delivery counts as an attempt.
+          # Release now so another worker can take it immediately. As with a
+          # killed Laravel job, this counts as an attempt.
           @logger.warn("[LaravelCloud] Shutdown timeout exceeded; releasing #{job_data['job_class']} (#{delivery.message_id}) for redelivery")
           release(delivery, 0)
           observer.released(delivery.queue, started_at, observer.now)
@@ -164,9 +144,8 @@ module LaravelCloud
       end
 
       # The watchdog only interrupts while @executing, so the interrupt lands in
-      # the job rather than in the outcome reporting around it — bar a job that
-      # finishes in the same instant, whose message is then redelivered and run
-      # again (SQS delivery is at-least-once regardless).
+      # the job, not the outcome reporting. A job finishing at that same instant
+      # may run again; SQS is at-least-once anyway.
       def execute(delivery, job_data)
         @executing = true
         Delivery.within(delivery) { ActiveJob::Base.execute(job_data) }
@@ -189,16 +168,15 @@ module LaravelCloud
           return
         end
 
-        # Terminal: delete it (the agent's "processed" — there is no "failed"
-        # outcome) and surface the failure through observability instead.
+        # Terminal: delete it (the agent has no "failed" outcome) and report the
+        # failure through observability.
         @logger.error("[LaravelCloud] #{job_data['job_class']} (#{delivery.message_id}) failed: #{error.class}: #{error.message}")
         acknowledge(delivery)
         observer.failed(delivery, error, started_at, observer.now)
         notify_failure(error, job_data)
       end
 
-      # Whether another delivery could turn out differently. A job class that
-      # can never run here, or a message out of attempts, can't.
+      # Whether another delivery could turn out differently.
       def retryable?(error)
         !error.is_a?(JobClass::Unrunnable) && !error.is_a?(MaxAttemptsExceeded)
       end
@@ -223,8 +201,7 @@ module LaravelCloud
         message_id = data["messageId"]
         return nil unless message_id.is_a?(String) && !message_id.empty?
 
-        # The agent reports the real queue URL the message came from; the
-        # outcome is reported, and metrics attributed, against that queue.
+        # The queue the message actually came from, for metrics.
         queue_url = data["queueUrl"].is_a?(String) && !data["queueUrl"].empty? ? data["queueUrl"] : config.queue_url
         attributes = data["attributes"].is_a?(Hash) ? data["attributes"] : {}
 
@@ -239,7 +216,7 @@ module LaravelCloud
         )
       end
 
-      # Poll each requested queue in turn, taking the first message found.
+      # Polls each queue in turn and takes the first message found.
       def receive_from_sqs
         queue_names.each do |name|
           queue_url = config.queue_url_for(name)
@@ -250,7 +227,7 @@ module LaravelCloud
             max_number_of_messages: 1,
             wait_time_seconds: 20,
             message_attribute_names: ["All"],
-            # ApproximateReceiveCount is the attempt counter for retries.
+            # The attempt counter (see Message.decode).
             message_system_attribute_names: ["ApproximateReceiveCount"],
           ).messages.first
 
@@ -282,9 +259,7 @@ module LaravelCloud
         end
       end
 
-      # Release the original message for SQS to redeliver after `delay` seconds.
-      # It is never re-sent, so this is unaffected by the 15-minute delay cap
-      # and works identically on FIFO queues.
+      # Have SQS redeliver the original message after `delay` seconds.
       def release(delivery, delay)
         if delivery.from_agent?
           report(delivery, "released", delay: delay)
@@ -297,9 +272,8 @@ module LaravelCloud
         end
       end
 
-      # An Unavailable agent escapes and ends the worker (it only recovers on a
-      # restart); a rejected outcome concerns this one message, so it's logged
-      # and the worker moves on.
+      # An unavailable agent ends the worker (it only recovers on restart); a
+      # rejected outcome only concerns this message, so it's just logged.
       def report(delivery, status, delay: nil)
         @runtime.agent.report(delivery.message_id, delivery.receipt_handle, status, delay: delay)
       rescue AgentClient::Rejected => e
@@ -320,9 +294,8 @@ module LaravelCloud
         false
       end
 
-      # Enforces the shutdown timeout. A signal handler can't wait or take a
-      # lock, so it only notes when the stop was asked for; this thread watches
-      # the clock and interrupts a job that outlives the timeout.
+      # Enforces the shutdown timeout: signal handlers can't wait or lock, so
+      # they only note the stop time and this thread watches the clock.
       def start_watchdog
         return nil if @shutdown_timeout.nil?
 
@@ -353,7 +326,7 @@ module LaravelCloud
       def trap_signals
         SIGNALS.to_h { |signal| [signal, Signal.trap(signal) { stop }] }
       rescue ArgumentError
-        # Not on the main thread (e.g. embedded in tests); signals stay as-is.
+        # Not on the main thread (e.g. in tests).
         nil
       end
 

@@ -4,16 +4,12 @@ require "securerandom"
 
 module LaravelCloud
   module Queue
-    # The push side of Managed Queues, behind the Active Job adapter. Pushing
-    # always goes straight to SQS, on Laravel Cloud and locally alike.
+    # Pushes jobs to SQS for the Active Job adapter.
     class Dispatcher
-      # SQS hard-caps a per-message delivery delay at 15 minutes.
+      # SQS limits: per-message delay, visibility timeout (a retry's backoff),
+      # and SendMessageBatch size.
       MAX_DELAY_SECONDS = 900
-
-      # SQS hard-caps a visibility timeout — and so a retry's backoff — at 12 hours.
       MAX_VISIBILITY_SECONDS = 43_200
-
-      # SendMessageBatch takes at most 10 messages, totalling at most 1 MiB.
       MAX_BATCH_MESSAGES = 10
       MAX_BATCH_BYTES = 1_048_576
 
@@ -21,8 +17,7 @@ module LaravelCloud
         @runtime = runtime
       end
 
-      # Push `job` to its managed queue, `delay` seconds from now (a Float, as
-      # Active Job computes it from `wait:` / `wait_until:`).
+      # `delay` is in seconds (a Float, from `wait:` / `wait_until:`).
       def dispatch(job, delay: 0)
         delivery = Delivery.current
 
@@ -33,15 +28,9 @@ module LaravelCloud
         end
       end
 
-      # Push many jobs with SendMessageBatch — `ActiveJob.perform_all_later`.
-      # Returns how many were enqueued, and marks each job enqueued or not, as
-      # Active Job expects of an adapter's enqueue_all.
-      #
-      # Every job is validated and encoded before anything is sent, so a
-      # dispatch the queue model can't honour raises with nothing half-sent.
-      # Past that, SQS accepts or rejects each message individually: a
-      # rejection lands on that job's `enqueue_error`, as it would for
-      # `perform_later`.
+      # `ActiveJob.perform_all_later`. Every job is validated before anything is
+      # sent, so an invalid one raises with nothing half-sent; a job SQS rejects
+      # gets an `enqueue_error`. Returns the number enqueued.
       def dispatch_all(jobs)
         entries = jobs.map do |job|
           queue = queue_for(job)
@@ -55,40 +44,27 @@ module LaravelCloud
         end
       end
 
-
       private
 
       def config
         @runtime.config
       end
 
-      # Active Job's retry re-enqueue of the job the worker is running. Instead
-      # of pushing a copy, the original message is released back to SQS: the
-      # worker resets its visibility once the job returns, so SQS redelivers the
-      # same message after the backoff. No duplicate is created, the backoff can
-      # run past the 15-minute send cap up to SQS's 12-hour visibility ceiling,
-      # and it works unchanged on FIFO queues, which reject per-message delays.
+      # A `retry_on` re-enqueue of the running job. Rather than pushing a copy,
+      # the original message is released for SQS to redeliver after the backoff:
+      # no duplicate, backoffs up to 12 hours, and it works on FIFO queues.
       def retry_job(job, delay, delivery)
-        # Visibility timeouts are whole seconds, so round the backoff UP:
-        # truncating a sub-second backoff to 0 would redeliver immediately and
-        # turn the backoff into a hot retry loop. (An explicit `wait: 0` still
-        # releases with no backoff — that is the caller's choice, and the
-        # attempts are still bounded by `retry_on`'s `attempts:`.) Then clamp to
-        # the 12-hour ceiling, which a long polynomial backoff can exceed.
+        # Round up: truncating a sub-second backoff to 0 would make a hot retry
+        # loop. Long polynomial backoffs are clamped to the 12-hour ceiling.
         seconds = delay.to_f.ceil.clamp(0, MAX_VISIBILITY_SECONDS)
 
-        # Record the release before anything else, so it's the outcome if the
-        # cross-queue push below fails: the job then retries in place rather
-        # than its message being deleted with no retry anywhere.
+        # Recorded first, so a failed cross-queue push below still retries here.
         delivery.release!(seconds)
         job.provider_job_id = delivery.message_id
 
-        # A retry that moves the job to another queue (`retry_on ..., queue:`)
-        # can't be a release — that would keep it where it is — so it's pushed
-        # there as a fresh message and the original is deleted. Attempts are
-        # per message (see Message.decode), so it starts again at attempt 1. Comparing against the queue name the message
-        # arrived with (not the queue it was received from) means only an
-        # explicit move takes this path.
+        # `retry_on ..., queue:` moves the job, which a release can't do: push
+        # it there as a new message and delete the original. Comparing with the
+        # queue name it arrived with means only an explicit move gets here.
         return if job.queue_name.to_s == delivery.job_queue_name.to_s
 
         push(job, queue_for(job), delay)
@@ -147,7 +123,7 @@ module LaravelCloud
         job.enqueue_error = error
       end
 
-      # Split one queue's messages by SendMessageBatch's count and size limits.
+      # Split one queue's messages by SendMessageBatch's limits.
       def batches(entries)
         batches = []
         bytes = 0
@@ -174,11 +150,8 @@ module LaravelCloud
         { message_body: Message.encode(job) }.merge(attributes_for(queue, delay, group: group, deduplication: deduplication))
       end
 
-      # A ".fifo" queue name marks a FIFO queue, which SQS treats specially: it
-      # requires a message group ID, requires a deduplication ID (unless the
-      # queue has content-based deduplication), and rejects the per-message
-      # delivery delay standard queues allow. A delay or attribute the queue
-      # model can't honour raises rather than being quietly dropped.
+      # FIFO queues need a group and deduplication ID and reject delays.
+      # Anything a queue can't honour raises rather than being dropped.
       def attributes_for(queue, delay, group:, deduplication:)
         if ManagedQueueConfig.fifo?(queue)
           if delay.to_f.positive?
@@ -186,13 +159,10 @@ module LaravelCloud
                                    "remove the wait or dispatch to a standard queue."
           end
 
-          # The group defaults to the queue name (all of its messages ordered
-          # together) and the deduplication ID to a unique value so messages
-          # aren't dropped as duplicates — Laravel's SqsQueue defaults.
+          # Laravel's SqsQueue defaults: one group per queue, unique dedupe IDs.
           { message_group_id: group || queue, message_deduplication_id: deduplication || SecureRandom.uuid }
         else
-          # Deduplication is a FIFO-only attribute; on a standard queue it would
-          # silently do nothing.
+          # Deduplication is FIFO-only; it would silently do nothing here.
           unless deduplication.nil?
             raise InvalidDispatch, "A message deduplication ID was set for the non-FIFO queue \"#{queue}\"; " \
                                    "deduplication requires a \".fifo\" queue."
@@ -200,18 +170,13 @@ module LaravelCloud
 
           attributes = {}
 
-          # A message group on a standard queue enables SQS fair queues: a pure
-          # tenant key (no ordering, no deduplication) that SQS uses to spread
-          # consumer capacity fairly across groups.
+          # On a standard queue a group is a fair-queues tenant key.
           attributes[:message_group_id] = group unless group.nil?
 
           if delay.to_f.positive?
             seconds = delay.to_f.ceil
 
-            # A longer delay is unsatisfiable, so fail loudly rather than
-            # delivering after 15 minutes: a job that must run in an hour is a
-            # bug if it runs in fifteen. (Retry backoff isn't bound by this — a
-            # retry is a release, handled above.)
+            # Raise rather than quietly run the job early.
             if seconds > MAX_DELAY_SECONDS
               raise InvalidDispatch, "A delay of #{seconds} seconds exceeds the SQS maximum of #{MAX_DELAY_SECONDS} " \
                                      "seconds (15 minutes); SQS cannot delay a message beyond 15 minutes."
@@ -237,11 +202,8 @@ module LaravelCloud
         job.respond_to?(name) ? job.public_send(name) : nil
       end
 
-      # The managed queue a job is pushed to. Active Job always names a queue —
-      # "default" unless the job says otherwise — so a job on Active Job's
-      # default queue goes to the environment's default managed queue (Laravel's
-      # "no ->onQueue()"), and any other queue name targets the managed queue
-      # of that name.
+      # Active Job's default queue maps to the environment's default managed
+      # queue; any other name is the managed queue of that name.
       def queue_for(job)
         name = job.queue_name.to_s
 

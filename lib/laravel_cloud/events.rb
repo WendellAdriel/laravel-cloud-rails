@@ -4,27 +4,18 @@ require "json"
 require "socket"
 
 module LaravelCloud
-  # Writes Laravel Cloud observability events to the in-container log socket.
-  #
-  # This is a port of Laravel's Illuminate\Foundation\Cloud\Events: it speaks
-  # the same wire protocol (newline-delimited JSON over a persistent stream
-  # socket) so a Rails app surfaces the exact same metrics in the Laravel Cloud
-  # dashboard as a Laravel app would.
-  #
-  # Every failure path is swallowed: observability must never take down a job
-  # or a request.
+  # Writes dashboard events to the Cloud log socket as newline-delimited JSON.
+  # A port of Laravel's Cloud\Events. Failures are swallowed: observability
+  # must never take down a job or a request.
   class Events
-    # How long a connect or write may block before the event is dropped.
     TIMEOUT = 2
 
-    # The address is a stream-socket address such as
-    # "unix:///tmp/cloud-init.sock" (a bare path is accepted too).
+    # e.g. "unix:///tmp/cloud-init.sock", or a bare path.
     def initialize(address)
       @path = address.to_s.delete_prefix("unix://")
       @socket = nil
 
-      # Enqueues emit from every request thread in a threaded server, so the
-      # shared socket is written to under a lock to keep lines from interleaving.
+      # Request threads all enqueue, so lock to keep lines from interleaving.
       @mutex = Mutex.new
     end
 
@@ -42,14 +33,12 @@ module LaravelCloud
         write(line)
       end
     rescue StandardError
-      # Observability is best-effort; a lost event is preferable to a failure.
     end
 
     private
 
-    # Laravel encodes with JSON_INVALID_UTF8_SUBSTITUTE: a malformed byte
-    # becomes U+FFFD and the event still goes out. Ruby's JSON raises instead,
-    # which would silently drop the event, so substitute before encoding.
+    # Like Laravel's JSON_INVALID_UTF8_SUBSTITUTE: bad bytes become U+FFFD.
+    # Ruby's JSON would raise instead, silently dropping the event.
     def scrub(value)
       case value
       when String then value.valid_encoding? && value.encoding == Encoding::UTF_8 ? value : value.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
@@ -62,8 +51,7 @@ module LaravelCloud
     def write(line)
       @socket.write(line)
     rescue StandardError
-      # A failed write leaves the stream in an unknown state, so drop it and let
-      # the next emit reconnect rather than writing into a half-sent line.
+      # The stream may hold a half-written line; reconnect on the next emit.
       disconnect
       raise
     end
@@ -78,10 +66,8 @@ module LaravelCloud
       @socket = socket
     end
 
-    # Whether the socket is still usable. A peer that hung up reads as EOF; a
-    # healthy idle socket has nothing to read, so a non-blocking peek tells the
-    # two apart without consuming anything meaningful (the collector never
-    # writes back).
+    # A non-blocking read tells a closed peer (EOF) from a healthy idle socket
+    # (nothing to read). The collector never writes back.
     def connected?
       return false if @socket.nil? || @socket.closed?
 

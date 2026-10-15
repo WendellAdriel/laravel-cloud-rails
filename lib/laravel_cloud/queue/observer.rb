@@ -5,12 +5,8 @@ require "securerandom"
 
 module LaravelCloud
   module Queue
-    # Emits Laravel Cloud queue observability events for managed-queue jobs, so
-    # the Cloud dashboard shows the same throughput, latency and failure metrics
-    # for a Rails app as it does for a Laravel one.
-    #
-    # The wire protocol matches Laravel's Foundation\Cloud\Queue +
-    # FailedJobProvider:
+    # Emits the dashboard's queue events, in the same format as Laravel's
+    # Cloud\Queue and Cloud\FailedJobProvider:
     #
     #   - "queued"     when a job is pushed onto a managed queue
     #   - "started"    when a worker picks a job up
@@ -42,27 +38,16 @@ module LaravelCloud
         emit_queue_event("released", queue, finished_at, "duration_ms" => duration_ms(started_at, finished_at))
       end
 
-      # A terminal failure is reported twice: as a "failed" lifecycle event, and
-      # as a failed job carrying the payload and exception so it can be
-      # inspected from the Laravel Cloud dashboard.
-      #
-      # The "failed_job" fields are exactly those of Laravel's Cloud
-      # FailedJobProvider::log — the dashboard's failed-job list is built from
-      # them, so none may be left out (including "job_name" and
-      # "exception_preview", which the dashboard lists failed jobs by).
-      #
-      # The order follows FailedJobProvider::log too: the failed job first,
-      # then the "failed" lifecycle event (its finishProcessingJob call).
+      # Matches FailedJobProvider::log exactly — the same fields, and the
+      # failed job before the "failed" event. The dashboard needs every field.
       def failed(delivery, error, started_at, finished_at)
         @events.emit(
           "_cloud_event" => "failed_job",
           "id" => uuid7(finished_at),
           "queue" => delivery.queue,
           "started_at" => format_time(started_at),
-          # SQS's ApproximateReceiveCount, mirroring Laravel's SqsJob::attempts().
           "attempts" => delivery.receive_count,
-          # The message body exactly as it sat on SQS: Laravel Cloud stores it
-          # and pushes it back verbatim to retry the job.
+          # Whole and unchanged: Cloud pushes it back as-is to retry the job.
           "payload" => delivery.body.to_s,
           "exception_preview" => preview(error),
           "job_name" => job_name(delivery.body),
@@ -78,8 +63,6 @@ module LaravelCloud
 
       private
 
-      # Every lifecycle emit funnels through here: the "_cloud_event"/"queue"
-      # channel and the "Y-m-d H:i:s.u" timestamp are the dashboard's contract.
       def emit_queue_event(type, queue, at, extra = {})
         @events.emit({
           "_cloud_event" => "queue",
@@ -89,9 +72,8 @@ module LaravelCloud
         }.merge(extra))
       end
 
-      # A time-ordered UUIDv7 for `time`, as Laravel's Str::uuid7($timestamp)
-      # gives a failed job's id: 48 bits of Unix milliseconds, then the version
-      # and variant bits around random data (RFC 9562).
+      # A UUIDv7 for `time`, like Laravel's Str::uuid7($timestamp). It must be
+      # v7: Cloud derives the failure time from it (UUIDv7ToDateTime).
       def uuid7(time)
         milliseconds = (time.to_r * 1000).to_i
         bytes = [milliseconds >> 16, milliseconds & 0xFFFF].pack("Nn") + SecureRandom.random_bytes(10)
@@ -111,8 +93,7 @@ module LaravelCloud
         [((finished_at - started_at) * 1000).round, 0].max
       end
 
-      # Laravel's one-line preview: "Class: message in file:line", or
-      # "Class in file:line" when there's no message.
+      # "Class: message in file:line", as Laravel previews it.
       def preview(error)
         location = error.backtrace_locations&.first
         where = location ? " in #{utf8(location.absolute_path || location.path)}:#{location.lineno}" : ""
@@ -122,7 +103,6 @@ module LaravelCloud
         line[0, MAX_EXCEPTION_PREVIEW_CHARS]
       end
 
-      # The payload's "displayName", as Laravel reads it; "" if there isn't one.
       def job_name(body)
         payload = JSON.parse(body.to_s)
         payload.is_a?(Hash) ? payload["displayName"].to_s : ""
@@ -130,18 +110,14 @@ module LaravelCloud
         ""
       end
 
-      # The exception led by "Class: message", then its backtrace — the shape
-      # of PHP's (string) $exception that Laravel and Symfony report, so the
-      # dashboard's first line reads the same.
+      # "Class: message" then the backtrace, like PHP's (string) $exception.
       def describe(error)
         ["#{error.class}: #{utf8(error.message)}", *Array(error.backtrace).map { |line| utf8(line) }].join("\n")
       end
 
-      # A job's exception can carry any bytes in any encoding (a binary message,
-      # a non-UTF-8 path). Reinterpret as UTF-8 with invalid bytes replaced by
-      # U+FFFD — PHP's JSON_INVALID_UTF8_SUBSTITUTE — before anything is built
-      # from it; mixing encodings would otherwise raise here, after the message
-      # is already deleted, and the failed job would never be reported.
+      # Exceptions can carry any bytes, and mixing encodings would raise here —
+      # after the message is deleted, losing the failed job. Invalid bytes
+      # become U+FFFD, like PHP's JSON_INVALID_UTF8_SUBSTITUTE.
       def utf8(value)
         value.to_s.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
       end

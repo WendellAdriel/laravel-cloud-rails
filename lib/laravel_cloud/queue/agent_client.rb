@@ -6,38 +6,26 @@ require "socket"
 
 module LaravelCloud
   module Queue
-    # Talks to the in-container cloud-agent over its unix runtime socket.
-    #
-    # The agent long-polls a single SQS queue on behalf of one consumer, holds
-    # the received message (heartbeating its visibility), and hands it over via
-    # GET /next. The consumer reports the terminal outcome via POST /result, at
-    # which point the agent performs the actual SQS delete or visibility change.
-    # The app container never touches SQS on the receive path.
+    # Talks to the Cloud agent over its unix socket. The agent long-polls SQS,
+    # hands messages over on GET /next, and on POST /result performs the
+    # delete or visibility change itself.
     class AgentClient
-      # The agent cannot serve work: its socket is unreachable or it answered
-      # with a server error. A wedged agent only recovers on restart, so the
-      # worker lets this escape and exits for the container to be restarted.
-      # The job is never lost — a dead agent stops heartbeating, so SQS
-      # redelivers once the visibility timeout lapses.
+      # The agent is unreachable or erroring. It only recovers on restart, so
+      # the worker exits; SQS redelivers anything in flight.
       class Unavailable < LaravelCloud::Error; end
 
-      # The agent refused a reported outcome (HTTP 4xx). It is the authority on
-      # what is valid for that one message, so the worker reports this and moves
-      # on rather than restarting.
+      # The agent refused one outcome (HTTP 4xx); the worker logs it and moves on.
       class Rejected < LaravelCloud::Error; end
 
-      # Outlast the agent's ~55s poll cycle so a 204 is a deliberate "nothing
-      # yet", never our own timeout cutting a poll short.
+      # Longer than the agent's ~55s poll, so a poll never times out early.
       NEXT_TIMEOUT = 65
       RESULT_TIMEOUT = 10
       RESULT_ATTEMPTS = 3
 
-      # Failures dialing the socket, before the agent has seen the request — the
-      # only ones safe to retry, since a report is never delivered twice.
+      # The agent hasn't seen the request yet, so these are safe to retry.
       CONNECT_ERRORS = [Errno::ENOENT, Errno::ECONNREFUSED].freeze
 
-      # Failures once the connection is up, where the agent may already have
-      # acted on the request.
+      # The agent may already have acted, so these aren't retried.
       TRANSPORT_ERRORS = [
         Errno::ECONNRESET, Errno::EPIPE, EOFError, IOError,
         Net::ReadTimeout, Net::WriteTimeout, Net::OpenTimeout, Net::HTTPBadResponse,
@@ -47,11 +35,8 @@ module LaravelCloud
         @socket_path = socket_path
       end
 
-      # Long-poll the agent for the next message.
-      #
-      # Returns the decoded payload (messageId, receiptHandle, body, attributes,
-      # queueUrl), or nil when the agent has nothing (HTTP 204). Anything else
-      # means the agent cannot serve work and raises Unavailable.
+      # The next message (messageId, receiptHandle, body, attributes, queueUrl),
+      # or nil when there's none.
       def next_message
         response = request(Net::HTTP::Get.new("/next"), timeout: NEXT_TIMEOUT)
 
@@ -67,15 +52,9 @@ module LaravelCloud
         raise Unavailable, "The Laravel Cloud agent returned a malformed body from GET /next."
       end
 
-      # Report a message's terminal outcome so the agent can stop heartbeating
-      # and perform the SQS operation. "processed" deletes the message;
-      # "released" resets its visibility (after `delay` seconds) so SQS
-      # redelivers it. There is no "failed" outcome: a terminal failure is
-      # reported as "processed" and its failure signal is emitted separately as
-      # an observability event.
-      #
-      # Transient socket hiccups are retried; a persistently unreachable socket
-      # or a server error raises Unavailable, a client error raises Rejected.
+      # "processed" deletes the message; "released" redelivers it after `delay`
+      # seconds. There's no "failed" outcome — failures are reported as
+      # "processed" and surfaced through observability.
       def report(message_id, receipt_handle, status, delay: nil)
         payload = {
           "messageId" => message_id,
@@ -117,8 +96,7 @@ module LaravelCloud
         http.open_timeout = timeout
         http.read_timeout = timeout
         http.write_timeout = timeout
-        # A single attempt: a long-poll must never be silently re-issued, and
-        # the result report owns its own retry policy above.
+        # Never re-issue a long-poll; #report retries on its own terms.
         http.max_retries = 0
 
         http.start { |connection| connection.request(request) }
@@ -130,9 +108,7 @@ module LaravelCloud
         raise Unavailable, "The Laravel Cloud agent request failed (#{e.class}: #{e.message})."
       end
 
-      # Net::HTTP speaking HTTP/1.1 over a unix socket instead of TCP — the
-      # agent's only transport. Everything above the socket (framing, keep-alive
-      # handling, timeouts) is stock Net::HTTP.
+      # Net::HTTP over a unix socket instead of TCP.
       class UnixHTTP < Net::HTTP
         attr_accessor :socket_path
 
@@ -142,8 +118,7 @@ module LaravelCloud
           socket = begin
             UNIXSocket.new(socket_path)
           rescue ArgumentError => e
-            # A path the OS can't use at all (e.g. over the ~104-byte limit) —
-            # misconfiguration, not a hiccup worth retrying.
+            # e.g. a path over the OS's ~104-byte limit: not worth retrying.
             raise Unavailable, "The Laravel Cloud agent socket path #{socket_path.inspect} is unusable: #{e.message}"
           end
 

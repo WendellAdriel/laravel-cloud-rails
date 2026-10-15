@@ -2,21 +2,14 @@
 
 module LaravelCloud
   module Queue
-    # Resolves the job class a message names, before anything is constantized
-    # on its say-so.
+    # Validates the job class a message names before constantizing it.
     module JobClass
-      # An (optionally namespaced) constant path, and nothing else.
       NAME_PATTERN = /\A[A-Z]\w*(::[A-Z]\w*)*\z/
 
-      # The message names something that can never run here: not a constant
-      # path, outside the allowlist, or not an Active Job. Terminal — retrying
-      # can't change the answer.
+      # Can never run here, so not retried.
       class Unrunnable < LaravelCloud::Error; end
 
-      # The message names a job class this process doesn't have — typically a
-      # rolling deploy, where an older worker receives a job class that only
-      # the new release defines. Retryable: a later delivery may land on a
-      # worker that has it.
+      # Not defined here, e.g. mid-deploy. Retried, as another worker may have it.
       class NotDefined < LaravelCloud::Error; end
 
       def self.resolve(name, allowed: nil)

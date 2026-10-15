@@ -4,17 +4,12 @@ require "json"
 
 module LaravelCloud
   module Queue
-    # The managed-queue message body: Active Job's own serialized job, wrapped
-    # with the identifying keys of Laravel's queue payload.
+    # The message body: Active Job's serialized job plus the "uuid" and
+    # "displayName" keys of Laravel's payload, which the dashboard names
+    # failed jobs by. Decoding only reads "data".
     #
     #   { "uuid": "<job_id>", "displayName": "ProcessReportJob", "data": { ...job.serialize... } }
-    #
-    # "uuid" and "displayName" mirror Laravel's payload shape so the Laravel
-    # Cloud dashboard can name a failed job. They are observability metadata
-    # only; decoding reads "data", so the extra keys round-trip harmlessly
-    # (including when the platform re-queues a failed job verbatim).
     module Message
-      # The body isn't a managed-queue message this integration can run.
       class Undecodable < LaravelCloud::Error; end
 
       def self.encode(job)
@@ -25,28 +20,14 @@ module LaravelCloud
         )
       end
 
-      # Decode a body into the job data Active Job executes, with its attempt
-      # counters bridged from SQS's delivery count.
+      # Decode a body into job data, with attempt counters taken from SQS.
       #
-      # Retries release the original message rather than pushing an updated
-      # copy (see Delivery), so a redelivered message still carries the job data
-      # from its first dispatch, and Active Job's own counters would read the
-      # same value forever — retrying without end. SQS counts deliveries for
-      # us, so we rebuild the counters from that: delivery #N has N-1 prior
-      # executions.
-      #
-      # Attempts are per message, as Laravel's are (SqsJob::attempts()), so any
-      # count stored in the payload is ignored. A message pushed afresh — a
-      # failed job Laravel Cloud puts back on the queue from the dashboard, or a
-      # retry moved onto another queue — starts again at attempt 1, the way
-      # Laravel's queue:retry resets attempts, and Cloud never has to edit the
-      # payload to make that so.
-      #
-      # `exception_executions` — Active Job's per-exception retry counters — is
-      # cleared: nothing could keep it up to date across a release. With it nil,
-      # `retry_on` falls back to the overall `executions` count, so `attempts:`
-      # counts every delivery of the job whichever exception failed it, the
-      # same way Laravel's `$tries` counts SQS receives.
+      # Retries release the original message (see Delivery), so its stored
+      # counters never change and `retry_on` would retry forever. Instead,
+      # delivery N has N-1 prior executions — per message, like Laravel's
+      # SqsJob::attempts(), so a freshly pushed message (a dashboard retry, a
+      # queue move) starts again at 1. `exception_executions` is cleared, which
+      # makes `retry_on` count all deliveries rather than per exception.
       def self.decode(body, receive_count: 1)
         payload = JSON.parse(body.to_s)
         data = payload["data"] if payload.is_a?(Hash)

@@ -2,25 +2,19 @@
 
 module LaravelCloud
   module Queue
-    # Optional, app-level Managed Queues settings, set from an initializer:
+    # Optional settings, set from an initializer:
     #
     #   LaravelCloud::Queue.configure do |queue|
     #     queue.allowed_job_classes = %w[ProcessReportJob SendInvoiceJob]
     #     queue.on_failure = ->(error, job_data) { Rails.error.report(error) }
     #   end
-    #
-    # Nothing here is required — the injected Cloud config covers the rest.
     class Settings
-      # Job class names the worker may run, or nil (the default) for any
-      # ActiveJob::Base subclass. Checked as strings *before* the class name
-      # from the message is constantized, so a name outside the list never
-      # triggers autoloading.
+      # Job class names the worker may run (nil: any Active Job). Checked before
+      # constantizing, so other names never trigger autoloading.
       attr_reader :allowed_job_classes
 
-      # Called with (error, job_data) when a job fails terminally — the place to
-      # report it to an error tracker. `job_data` is the job's serialized hash
-      # (nil if the message couldn't be decoded that far). Errors raised by the
-      # handler are logged and swallowed.
+      # Called with (error, job_data) when a job fails for good. Errors it
+      # raises are logged and ignored.
       attr_accessor :on_failure
 
       def initialize

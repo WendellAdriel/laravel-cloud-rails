@@ -3,26 +3,17 @@
 require "aws-sdk-sqs"
 
 module LaravelCloud
-  # Laravel Cloud Managed Queues for Active Job.
-  #
-  # Pushing always goes straight to SQS. Receiving goes through the in-container
-  # cloud-agent sidecar on Laravel Cloud, or straight from SQS when there is no
-  # agent (local development). Retries are Active Job's own `retry_on`,
-  # executed as SQS visibility resets of the original message — see Delivery.
+  # Laravel Cloud Managed Queues for Active Job. Jobs are pushed straight to
+  # SQS, and received through the Cloud agent or, without one, from SQS.
   module Queue
-    # No managed queue is provisioned (LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG is
-    # absent) but one was needed.
+    # LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG is missing.
     class NotConfigured < LaravelCloud::Error; end
 
-    # A dispatch the queue model can't honour — a delay beyond the SQS cap, a
-    # delay on a FIFO queue, FIFO deduplication on a standard queue. Raised
-    # rather than silently degraded.
+    # A dispatch the queue can't honour, raised rather than silently degraded.
     class InvalidDispatch < LaravelCloud::Error; end
 
-    # The collaborators the adapter and worker share, built lazily so an app
-    # boots (and enqueues raise a clear NotConfigured) with no managed queue
-    # provisioned. Anything can be injected, which is how the tests swap in a
-    # stubbed SQS client and a real-socket agent stub.
+    # What the adapter and worker share. Built lazily, so an app boots without
+    # a managed queue; injectable for tests.
     class Runtime
       attr_reader :settings
 
@@ -59,9 +50,8 @@ module LaravelCloud
       def build_sqs_client
         args = { region: config.region || "us-east-1" }
 
-        # Laravel Cloud runs on ECS and signals "use the container credential
-        # provider" with credentials: "ecs". Anything else falls through to the
-        # SDK's default chain (env vars, profiles, instance role).
+        # "ecs" means the container credential provider; otherwise the SDK's
+        # default chain.
         args[:credentials] = Aws::ECSCredentials.new if config.ecs_credentials?
 
         Aws::SQS::Client.new(**args)
@@ -75,7 +65,6 @@ module LaravelCloud
 
       attr_writer :runtime
 
-      # Adjust the optional app-level settings — see Settings.
       def configure
         yield runtime.settings
       end

@@ -4,11 +4,7 @@ require "json"
 
 module LaravelCloud
   module Queue
-    # Parses the LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG blob injected by Laravel
-    # Cloud and exposes the bits the adapter and worker need: the SQS queue URL,
-    # region, credential mode, and the in-container agent's runtime socket.
-    #
-    # The injected JSON looks like:
+    # Parses LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG, which Laravel Cloud injects:
     #
     #   {
     #     "driver": "cloud",
@@ -36,22 +32,15 @@ module LaravelCloud
         from_json(env["LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG"], agent_socket: env["LARAVEL_CLOUD_AGENT_SOCKET"])
       end
 
-      # Build the config from the raw env values. Both may be nil/empty (running
-      # locally with no managed queue) — the result then simply reports itself
-      # as not configured rather than raising, so the app still boots.
+      # Missing or malformed config gives an unconfigured result rather than an
+      # error, so the app still boots.
       def self.from_json(json, agent_socket: nil)
         data = parse(json)
         connection = data["connection"].is_a?(Hash) ? data["connection"] : {}
 
-        # Laravel Cloud injects an "agent" slice describing the in-container
-        # cloud-agent sidecar: whether it is serving this container ("enabled")
-        # and the runtime socket to reach it on ("socket"). The flag decides the
-        # receive path — see #agent_available?.
         agent = data["agent"].is_a?(Hash) ? data["agent"] : {}
 
-        # The socket comes from the agent slice, falling back to the
-        # LARAVEL_CLOUD_AGENT_SOCKET override and finally the conventional
-        # default, so the agent always has a path to dial when enabled.
+        # Agent socket: the config's, then LARAVEL_CLOUD_AGENT_SOCKET, then the default.
         socket = presence(agent["socket"]) || presence(agent_socket) || DEFAULT_AGENT_SOCKET
 
         new(
@@ -80,9 +69,7 @@ module LaravelCloud
       end
       private_class_method :presence
 
-      # Whether a logical queue name denotes a FIFO queue. The ".fifo" suffix is
-      # the single marker SQS (and Laravel) use, so every FIFO branch routes
-      # through this one predicate rather than re-testing the suffix inline.
+      # ".fifo" is the only marker SQS and Laravel use for FIFO queues.
       def self.fifo?(queue)
         queue.to_s.end_with?(FIFO_SUFFIX)
       end
@@ -98,16 +85,9 @@ module LaravelCloud
         @queue_url = queue_url_for(queue)
       end
 
-      # The full SQS queue URL for a logical managed-queue name — how a named
-      # queue ("critical") is resolved on both the dispatch path and the
-      # SQS-direct receive path. Nil when no prefix is configured (running
-      # locally with no managed queue).
-      #
-      # Assembled the same way as Laravel's SqsQueue::suffixQueue. For a
-      # standard queue that is {prefix}/{queue}{suffix}. A FIFO queue name must
-      # keep ".fifo" at the very end, so the per-environment suffix goes *before*
-      # it — {prefix}/{base}{suffix}.fifo — not after it, which would point at a
-      # queue that doesn't exist. This is the inverse of #normalize_queue.
+      # The SQS URL for a queue name, as Laravel's SqsQueue::suffixQueue builds
+      # it: {prefix}/{queue}{suffix}, with the suffix before ".fifo" on FIFO
+      # queues ({prefix}/{base}{suffix}.fifo). Nil when unconfigured.
       def queue_url_for(queue)
         return nil if prefix.empty?
 
@@ -118,10 +98,8 @@ module LaravelCloud
         end
       end
 
-      # Reduce a full SQS queue URL (or name) back to its logical queue name by
-      # stripping the configured prefix and suffix — the name the Laravel Cloud
-      # dashboard groups metrics under. Mirrors Laravel's Cloud\Queue::
-      # normalizeQueue, keeping a trailing ".fifo" in place for FIFO queues.
+      # The queue name for an SQS URL — the inverse of #queue_url_for, and the
+      # name the dashboard groups metrics by (Laravel's Cloud\Queue::normalizeQueue).
       def normalize_queue(queue)
         queue = queue.to_s
         queue = queue.delete_prefix("#{prefix}/") unless prefix.empty?
@@ -136,25 +114,16 @@ module LaravelCloud
         end
       end
 
-      # Whether a managed queue has actually been provisioned (there is a queue
-      # URL to push to). False when running outside Laravel Cloud.
       def configured?
         !queue_url.nil?
       end
 
-      # Whether the in-container cloud-agent should be used for receiving.
-      #
-      # Driven by the "enabled" flag in the injected config rather than probing
-      # the socket on disk: Laravel Cloud tells us authoritatively whether the
-      # sidecar is serving this container, which is more reliable than racing a
-      # socket that may appear or vanish. Outside Laravel Cloud the flag is
-      # absent, so the worker receives straight from SQS.
+      # Whether to receive through the Cloud agent. Trusts the config's flag
+      # rather than probing for the socket, which may appear or vanish.
       def agent_available?
         @agent_enabled
       end
 
-      # Whether SQS credentials should come from the ECS container credential
-      # provider rather than the SDK's default chain.
       def ecs_credentials?
         credentials == "ecs"
       end

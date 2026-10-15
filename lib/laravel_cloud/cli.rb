@@ -3,13 +3,8 @@
 require "optparse"
 
 module LaravelCloud
-  # The `laravel-cloud` command — the process Laravel Cloud runs for a Rails
-  # app's queue workers:
-  #
-  #   laravel-cloud queue:work [options]
-  #
-  # Run from the application root (`bundle exec laravel-cloud ...`): it boots
-  # the app from config/environment.rb, as `bin/rails runner` would.
+  # `laravel-cloud queue:work [options]`, the queue worker Laravel Cloud runs.
+  # Boots the app from config/environment.rb, so run it from the app root.
   class CLI
     def initialize(argv, out: $stdout, err: $stderr, boot: true)
       @argv = argv.dup
@@ -18,7 +13,6 @@ module LaravelCloud
       @boot = boot
     end
 
-    # Returns the process exit status.
     def run
       command = @argv.shift
 
@@ -35,9 +29,8 @@ module LaravelCloud
       @err.puts("#{e.message}\n\n#{usage}")
       1
     rescue LaravelCloud::Error => e
-      # Expected failures — an unreachable agent, a missing managed queue —
-      # exit non-zero with the reason, no backtrace. On Cloud a non-zero
-      # worker exit gets the container restarted.
+      # Expected failures exit non-zero without a backtrace; on Cloud that
+      # restarts the container.
       @err.puts("[LaravelCloud] #{e.message}")
       1
     end
@@ -81,8 +74,7 @@ module LaravelCloud
 
       require environment
 
-      # A long-lived worker wants the app fully loaded up front, as it would be
-      # when serving requests; booting this way skips eager loading otherwise.
+      # Booting this way skips eager loading, which a long-lived worker wants.
       Rails.application.eager_load! if Rails.application.config.eager_load
     end
 
