@@ -4,16 +4,13 @@ require "optparse"
 
 module LaravelCloud
   # The `laravel-cloud` command — the process Laravel Cloud runs for a Rails
-  # app's queue workers and failed-job retries:
+  # app's queue workers:
   #
   #   laravel-cloud queue:work [options]
-  #   laravel-cloud queue:retry <failed-job-url>...
   #
   # Run from the application root (`bundle exec laravel-cloud ...`): it boots
   # the app from config/environment.rb, as `bin/rails runner` would.
   class CLI
-    COMMANDS = %w[queue:work queue:retry].freeze
-
     def initialize(argv, out: $stdout, err: $stderr, boot: true)
       @argv = argv.dup
       @out = out
@@ -27,7 +24,6 @@ module LaravelCloud
 
       case command
       when "queue:work" then work
-      when "queue:retry" then retry_failed_job
       when "-v", "--version"
         @out.puts("laravel-cloud #{VERSION}")
         0
@@ -39,9 +35,9 @@ module LaravelCloud
       @err.puts("#{e.message}\n\n#{usage}")
       1
     rescue LaravelCloud::Error => e
-      # Expected failures — an unreachable agent, a missing managed queue, a
-      # failed job that can't be retried — exit non-zero with the reason, no
-      # backtrace. On Cloud a non-zero worker exit gets the container restarted.
+      # Expected failures — an unreachable agent, a missing managed queue —
+      # exit non-zero with the reason, no backtrace. On Cloud a non-zero
+      # worker exit gets the container restarted.
       @err.puts("[LaravelCloud] #{e.message}")
       1
     end
@@ -73,37 +69,6 @@ module LaravelCloud
       0
     end
 
-    # Mirrors Laravel's queue:retry: each URL may yield many failed jobs, each
-    # reported as it's retried. Exits 1 if any job was skipped.
-    def retry_failed_job
-      urls = @argv.reject(&:empty?)
-
-      if urls.empty?
-        @err.puts("Usage: laravel-cloud queue:retry <failed-job-url>...")
-        return 1
-      end
-
-      boot_app
-
-      @out.puts("Pushing failed queue jobs back onto the queue.")
-      retrier = Queue::FailedJobRetrier.new
-      skipped = 0
-
-      urls.each do |url|
-        results = retrier.retry(url) do |result|
-          if result.retried?
-            @out.puts("  #{result.id} (#{result.queue}) DONE")
-          else
-            skipped += 1
-            @err.puts("  #{result.id} (#{result.queue}) SKIPPED: can't be retried, #{result.error}")
-          end
-        end
-
-        @err.puts("Unable to find any failed jobs with ID [#{url}].") if results.empty?
-      end
-
-      skipped.zero? ? 0 : 1
-    end
 
     def boot_app
       return unless @boot
@@ -127,7 +92,6 @@ module LaravelCloud
 
         Commands:
           queue:work                 Process Laravel Cloud managed queue jobs (--help for options)
-          queue:retry <url>...       Retry the failed jobs Laravel Cloud hands over
       USAGE
     end
   end

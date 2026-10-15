@@ -55,15 +55,6 @@ module LaravelCloud
         end
       end
 
-      # Push an already-encoded message body as it stands — a failed job being
-      # retried from the dashboard. A FIFO queue still needs a group and a
-      # deduplication ID; the job's own are gone with the original message, so
-      # the defaults apply.
-      def push_body(queue, body)
-        message = { message_body: body }.merge(attributes_for(queue, 0, group: nil, deduplication: nil))
-
-        send_message(queue, message)
-      end
 
       private
 
@@ -94,8 +85,8 @@ module LaravelCloud
 
         # A retry that moves the job to another queue (`retry_on ..., queue:`)
         # can't be a release — that would keep it where it is — so it's pushed
-        # there as a fresh message carrying the job's current counters, and the
-        # original is deleted. Comparing against the queue name the message
+        # there as a fresh message and the original is deleted. Attempts are
+        # per message (see Message.decode), so it starts again at attempt 1. Comparing against the queue name the message
         # arrived with (not the queue it was received from) means only an
         # explicit move takes this path.
         return if job.queue_name.to_s == delivery.job_queue_name.to_s

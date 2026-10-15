@@ -33,8 +33,14 @@ module LaravelCloud
       # from its first dispatch, and Active Job's own counters would read the
       # same value forever — retrying without end. SQS counts deliveries for
       # us, so we rebuild the counters from that: delivery #N has N-1 prior
-      # executions on top of whatever the payload already carried (non-zero
-      # only when the job was re-pushed, e.g. retried onto another queue).
+      # executions.
+      #
+      # Attempts are per message, as Laravel's are (SqsJob::attempts()), so any
+      # count stored in the payload is ignored. A message pushed afresh — a
+      # failed job Laravel Cloud puts back on the queue from the dashboard, or a
+      # retry moved onto another queue — starts again at attempt 1, the way
+      # Laravel's queue:retry resets attempts, and Cloud never has to edit the
+      # payload to make that so.
       #
       # `exception_executions` — Active Job's per-exception retry counters — is
       # cleared: nothing could keep it up to date across a release. With it nil,
@@ -50,7 +56,7 @@ module LaravelCloud
         end
 
         data.merge(
-          "executions" => data["executions"].to_i + [receive_count.to_i, 1].max - 1,
+          "executions" => [receive_count.to_i, 1].max - 1,
           "exception_executions" => nil,
         )
       rescue JSON::ParserError

@@ -14,7 +14,8 @@ primitives, with each capability self-contained beside it.
 The **only feature today is Managed Queues** — Laravel Cloud's managed SQS
 queues as an Active Job adapter (`config.active_job.queue_adapter = :cloud`)
 plus the `laravel-cloud` executable Laravel Cloud runs: `queue:work` (the
-worker) and `queue:retry <url>` (retrying a failed job from the dashboard).
+worker). Failed jobs are retried by Laravel Cloud itself, which pushes them
+straight to SQS (see "Dashboard retries").
 
 - Ruby `>= 3.2`, Active Job `>= 7.1`, `aws-sdk-sqs` `~> 1.80`.
 - Module `LaravelCloud` under `lib/laravel_cloud/`; the adapter must live at
@@ -35,7 +36,6 @@ LaravelCloud                       ← thin host (lib/laravel_cloud.rb)
        ├─ Worker                   receive → execute → report one outcome per message; tries, cap, shutdown
        ├─ JobClass                 validates the message's job class before constantizing it
        ├─ RetryAttempts            wraps `retry_on` to record its `attempts:` for the delivery cap
-       ├─ FailedJobRetrier         `queue:retry`: fetch, decrypt (LaravelEncrypter, APP_KEY), re-push
        ├─ Delivery                 one received message + the retry verdict recorded while it runs
        ├─ Message                  payload codec + attempt-counter bridge
        ├─ Observer                 queue lifecycle + failed_job events
@@ -82,11 +82,14 @@ resets** — no re-push, no duplicate:
    release (backoff ceil'd to whole seconds, clamped to 12h) instead of pushing.
    The worker performs it after the job returns.
 2. **Counter bridge.** A released message comes back with its original job
-   data, so `Message.decode` rebuilds `executions` from SQS's
-   `ApproximateReceiveCount` and **nils `exception_executions`** — Active Job
-   then falls back to the overall `executions` count in `retry_on`. Without
-   this, retries never end. Consequence (documented in the README): attempts
-   are counted across all `retry_on` rules, Laravel-style.
+   data, so `Message.decode` sets `executions` from SQS's
+   `ApproximateReceiveCount` alone (receive N → N-1) and **nils
+   `exception_executions`** — Active Job then falls back to the overall
+   `executions` count in `retry_on`. Without this, retries never end.
+   Attempts are therefore **per message**: any count stored in the payload is
+   ignored, so a freshly pushed message (a dashboard retry, a queue move)
+   starts again at 1, and attempts are shared across all `retry_on` rules,
+   Laravel-style. Both are documented in the README.
 3. **Moving queues.** `retry_on ..., queue:` changes the job's `queue_name`
    from the one it arrived with; that can't be a release, so it's pushed to the
    new queue and the original deleted. The release is recorded first so a
@@ -116,21 +119,24 @@ enforced by a watchdog thread that raises `Worker::Shutdown` (an `Exception`,
 so `retry_on`/`rescue` don't catch it) into the job; its message is released
 with 0 delay. The abandoned delivery counts as an attempt.
 
-### Failed-job retry
+### Dashboard retries (Laravel Cloud's side)
 
-A port of Laravel 13's `Cloud\FailedJobProvider::find`/`forget` plus the
-`queue:retry` loop. `FailedJobRetrier` GETs the URL Cloud hands over with
-`Cloud-Payload-Version: 1` and `Cloud-Encryption-Cipher` (`AES-256-CBC` for a
-32-byte key), using Laravel's retry policy (10 attempts, 500ms·2ⁿ backoff, no
-retry on 403). It decrypts the body with `APP_KEY` (Laravel's Encrypter
-format; CBC+HMAC or GCM, read from the payload). A version-1 response is a page
-`{data: [failed jobs], links: {self, next}}` and the retrier follows `next`; an
-unversioned response is one failed job (legacy). For each job the payload is
-pushed back verbatim (fresh receive count), and only then is a `failed_job`
-event with `retried_at` emitted for that job's `id`. A push failure raises and
-stops the run, as in Laravel. Payloads trimmed by the collector workaround
-(`data_truncated`) are skipped and left in the dashboard rather than aborting
-the batch, which is our only deliberate departure from Laravel.
+The app runs nothing to retry a failed job: Laravel Cloud pushes the stored
+`failed_job` payload straight onto SQS. There's no Active Job hook to honour
+(no `JobRetryRequested` / `retryUntil` equivalent), so nothing is lost by
+skipping the app. For it to work, Cloud's push must:
+
+- go to `{prefix}/{queue}{suffix}`, with the suffix *before* `.fifo` on FIFO
+  queues — `ManagedQueueConfig#queue_url_for`, Laravel's `SqsQueue` rule;
+- send the stored `payload` **verbatim** — the worker reads `data` and ignores
+  any stored attempt count (see the counter bridge), so no editing is needed;
+- on a `.fifo` queue, set `MessageGroupId` (the queue name) and a unique
+  `MessageDeduplicationId` — the job's own group ID isn't kept;
+- refuse payloads with `"data_truncated": true` (trimmed by the collector
+  workaround in `Observer`); they can't be rebuilt and would only be deleted
+  as undecodable.
+
+### Failed-job reporting
 
 The `failed_job` event the worker emits matches `FailedJobProvider::log`
 (laravel/framework 13.x): exactly its fields, including `job_name` and
@@ -179,9 +185,8 @@ bundle exec rake test
   recording sink.
 - **Retries**: `worker_test.rb` / `agent_worker_test.rb` drive real `retry_on`
   / `discard_on` end to end; `worker_tries_test.rb` covers tries, the cap and
-  shutdown; `failed_job_retry_test.rb` round-trips a real failed job through
-  the encrypter and back onto the queue. Prefer adding there over asserting
-  internals.
+  shutdown; `cloud_socket_test.rb` checks the failed-job event on a real
+  socket. Prefer adding there over asserting internals.
 
 ## Conventions to keep
 

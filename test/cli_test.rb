@@ -3,7 +3,6 @@
 require "test_helper"
 require "laravel_cloud/cli"
 require "stringio"
-require "minitest/mock"
 
 class CLITest < Minitest::Test
   PERFORMED = []
@@ -34,31 +33,6 @@ class CLITest < Minitest::Test
 
     assert_equal 1, cli("queue:work", "--stop-when-empty")
     assert_match(/LARAVEL_CLOUD_MANAGED_QUEUES_CONFIG is missing/, @err.string)
-  end
-
-  def test_queue_retry_needs_a_url
-    assert_equal 1, cli("queue:retry")
-    assert_match(/Usage: laravel-cloud queue:retry/, @err.string)
-  end
-
-  def test_queue_retry_reports_each_failed_job_and_exits_non_zero_if_any_were_skipped
-    result = LaravelCloud::Queue::FailedJobRetrier::Result
-    results = {
-      "https://cloud/a" => [result.new("a", "default", nil), result.new("big", "default", "its payload was too large to be kept whole")],
-      "https://cloud/empty" => [],
-    }
-    retrier = Object.new
-    retrier.define_singleton_method(:retry) do |url, &block|
-      results.fetch(url).each(&block)
-      results.fetch(url)
-    end
-
-    status = LaravelCloud::Queue::FailedJobRetrier.stub(:new, retrier) { cli("queue:retry", "https://cloud/a", "https://cloud/empty") }
-
-    assert_equal 1, status
-    assert_match(/a \(default\) DONE/, @out.string)
-    assert_match(/big \(default\) SKIPPED: can't be retried, its payload was too large/, @err.string)
-    assert_match(%r{Unable to find any failed jobs with ID \[https://cloud/empty\]}, @err.string)
   end
 
   def test_unknown_commands_and_options_are_rejected

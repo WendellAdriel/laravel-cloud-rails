@@ -17,8 +17,7 @@ module LaravelCloud
     #   - "processed"  when the job succeeds
     #   - "released"   when the job fails but will be retried
     #   - "failed"     when the job fails terminally
-    #   - "failed_job" the payload + exception for a terminal failure, and
-    #                  again with "retried_at" when it's retried from the dashboard
+    #   - "failed_job" the payload + exception for a terminal failure
     class Observer
       # Byte budgets for the two large fields of a "failed_job" event.
       #
@@ -88,16 +87,6 @@ module LaravelCloud
         emit_queue_event("failed", delivery.queue, finished_at, "duration_ms" => duration_ms(started_at, finished_at))
       end
 
-      # A failed job retried from the dashboard: the same "failed_job" channel,
-      # marked with "retried_at" so the dashboard records it as retried.
-      def retried(id, queue)
-        @events.emit(
-          "_cloud_event" => "failed_job",
-          "id" => id,
-          "queue" => queue,
-          "retried_at" => format_time(now),
-        )
-      end
 
       def now
         Time.now.utc

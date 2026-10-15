@@ -40,7 +40,7 @@ class WorkerTest < Minitest::Test
 
     def perform
       PERFORMED << [queue_name, executions]
-      raise Flaky if executions < 2
+      raise Flaky if queue_name == "default"
     end
   end
 
@@ -126,10 +126,23 @@ class WorkerTest < Minitest::Test
     work_off
     work_off(queues: ["slow"])
 
-    assert_equal [["default", 1], ["slow", 2]], PERFORMED
+    # Attempts are per message, so the moved job starts again at 1 there.
+    assert_equal [["default", 1], ["slow", 1]], PERFORMED
     assert_equal [queue_url("default"), queue_url("slow")], @sqs.sent.map { |sent| sent[:queue_url] }
     assert_empty @sqs.visibility_changes
     assert_empty @sqs.pending
+  end
+
+  def test_a_re_pushed_message_starts_again_at_attempt_one
+    # What Laravel Cloud pushes when a failed job is retried from the dashboard:
+    # the stored body, verbatim — counters and all.
+    payload = JSON.parse(LaravelCloud::Queue::Message.encode(SuccessfulJob.new("again")))
+    payload["data"]["executions"] = 4
+    @sqs.inject(queue_url("default"), JSON.generate(payload))
+
+    work_off
+
+    assert_equal [["again", 1]], PERFORMED
   end
 
   def test_an_unhandled_exception_is_terminal
