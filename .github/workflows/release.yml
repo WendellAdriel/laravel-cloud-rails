@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  publish:
+    name: Publish to RubyGems
+    runs-on: ubuntu-latest
+    environment: release
+
+    permissions:
+      contents: read
+      id-token: write # RubyGems trusted publishing
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.4"
+          bundler-cache: true
+
+      - name: Run the tests
+        run: bundle exec rake test
+
+      # The release tag is the version: v1.2.0 (or 1.2.0) publishes 1.2.0, and
+      # v1.2.0.beta1 a prerelease. Hyphenated tags are refused, since RubyGems
+      # would rewrite them (1.2.0-rc.1 becomes 1.2.0.pre.rc.1).
+      - name: Set the version from the release tag
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          ruby -e '
+            version = ENV.fetch("TAG").delete_prefix("v")
+            abort "::error::Release tag #{ENV["TAG"]} is not a version (e.g. v1.2.0)." unless version.match?(/\A\d+\.\d+\.\d+(\.[0-9A-Za-z]+)*\z/)
+
+            path = "lib/laravel_cloud/version.rb"
+            File.write(path, File.read(path).sub(/VERSION = ".*"/, %(VERSION = "#{version}")))
+            puts "Publishing #{version}"
+          '
+
+      - name: Build the gem
+        run: gem build rails-on-cloud.gemspec --output rails-on-cloud.gem
+
+      - uses: rubygems/configure-rubygems-credentials@v1.0.0
+
+      - name: Publish the gem
+        run: gem push rails-on-cloud.gem
