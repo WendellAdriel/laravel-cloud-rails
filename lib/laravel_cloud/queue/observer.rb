@@ -19,23 +19,6 @@ module LaravelCloud
     #   - "failed"     when the job fails terminally
     #   - "failed_job" the payload + exception for a terminal failure
     class Observer
-      # Byte budgets for the two large fields of a "failed_job" event.
-      #
-      # TODO: REMOVE THIS TRIMMING once the platform's logging collector
-      # reassembles CRI partial log lines. It is a temporary workaround — the
-      # caps, #trim_payload/#truncate and their call sites should all go, and
-      # the full payload/exception be emitted again.
-      #
-      # Laravel Cloud's log pipeline ships container output through a Fluent Bit
-      # collector. containerd splits any line over 16 KiB into CRI partial
-      # records, which the collector doesn't currently stitch back together
-      # (no `multiline.parser cri`), so an oversized event arrives as truncated,
-      # invalid JSON and never reaches the dashboard. Lifecycle events are tiny;
-      # only "failed_job" (payload + backtrace) crosses the line, so it is kept
-      # comfortably under 16 KiB here. The real fix belongs in the collector.
-      MAX_EXCEPTION_BYTES = 4000
-      MAX_PAYLOAD_DATA_BYTES = 2000
-
       # Laravel caps the one-line exception preview at 1001 characters.
       MAX_EXCEPTION_PREVIEW_CHARS = 1001
 
@@ -78,15 +61,16 @@ module LaravelCloud
           "started_at" => format_time(started_at),
           # SQS's ApproximateReceiveCount, mirroring Laravel's SqsJob::attempts().
           "attempts" => delivery.receive_count,
-          "payload" => trim_payload(delivery.body),
+          # The message body exactly as it sat on SQS: Laravel Cloud stores it
+          # and pushes it back verbatim to retry the job.
+          "payload" => delivery.body.to_s,
           "exception_preview" => preview(error),
           "job_name" => job_name(delivery.body),
-          "exception" => truncate(describe(error), MAX_EXCEPTION_BYTES),
+          "exception" => describe(error),
         )
 
         emit_queue_event("failed", delivery.queue, finished_at, "duration_ms" => duration_ms(started_at, finished_at))
       end
-
 
       def now
         Time.now.utc
@@ -160,36 +144,6 @@ module LaravelCloud
       # is already deleted, and the failed job would never be reported.
       def utf8(value)
         value.to_s.dup.force_encoding(Encoding::UTF_8).scrub("\uFFFD")
-      end
-
-      # Shrink the failed-job payload to keep the event under the collector's
-      # line limit (see the constants). The identifying "uuid"/"displayName"
-      # survive so the dashboard can still name the job; the bulky job data is
-      # truncated. A truncated payload can't reconstruct the job, an accepted
-      # trade-off of the workaround.
-      def trim_payload(body)
-        payload = JSON.parse(body.to_s)
-        return truncate(body.to_s, MAX_PAYLOAD_DATA_BYTES) unless payload.is_a?(Hash)
-
-        data = JSON.generate(payload["data"])
-        return body if data.bytesize <= MAX_PAYLOAD_DATA_BYTES
-
-        JSON.generate(
-          "uuid" => payload["uuid"],
-          "displayName" => payload["displayName"],
-          "data" => data.byteslice(0, MAX_PAYLOAD_DATA_BYTES).scrub(""),
-          "data_truncated" => true,
-        )
-      rescue JSON::ParserError, JSON::GeneratorError
-        truncate(body.to_s.scrub, MAX_PAYLOAD_DATA_BYTES)
-      end
-
-      # Cut a string to at most `max_bytes`, appending an elision marker when
-      # anything was removed, without splitting a UTF-8 sequence.
-      def truncate(value, max_bytes)
-        return value if value.bytesize <= max_bytes
-
-        "#{value.byteslice(0, max_bytes).scrub('')}\n…[truncated #{value.bytesize - max_bytes} bytes — see logging-collector CRI note]"
       end
     end
   end

@@ -187,10 +187,6 @@ original message back on its queue, where it starts again at attempt 1. Nothing
 runs in your app to do this. Active Job's enqueue callbacks don't fire for a
 retried job, since it isn't enqueued again from Ruby.
 
-The dashboard keeps job data of up to about 2 KB per failed job. A job with
-more data than that can't be rebuilt, so it can't be retried from the
-dashboard.
-
 ### Running workers
 
 ```bash

@@ -131,10 +131,10 @@ skipping the app. For it to work, Cloud's push must:
 - send the stored `payload` **verbatim** — the worker reads `data` and ignores
   any stored attempt count (see the counter bridge), so no editing is needed;
 - on a `.fifo` queue, set `MessageGroupId` (the queue name) and a unique
-  `MessageDeduplicationId` — the job's own group ID isn't kept;
-- refuse payloads with `"data_truncated": true` (trimmed by the collector
-  workaround in `Observer`); they can't be rebuilt and would only be deleted
-  as undecodable.
+  `MessageDeduplicationId` — the job's own group ID isn't kept.
+
+The stored payload is the message body exactly as it sat on SQS: the worker
+emits it whole in `failed_job`, never trimmed.
 
 ### Failed-job reporting
 
@@ -155,9 +155,11 @@ added.
 
 `Observer` emits `queued` · `started` · `processed` · `released` · `failed`
 (`_cloud_event: "queue"`, `"Y-m-d H:i:s.u"` UTC timestamps) and `failed_job`
-(attempts = receive count). The `MAX_*_BYTES` trimming of `failed_job` is a
-**temporary workaround** for the log collector's 16 KiB CRI line limit,
-documented in-file — not permanent.
+(attempts = receive count). `failed_job` carries the full payload and
+exception, untrimmed, as Laravel's `FailedJobProvider::log` does. If a large
+event ever runs into the log pipeline's line limits (containerd splits lines
+over 16 KiB), fix it there or deliberately here, not by quietly trimming the
+payload, which Cloud needs whole to retry the job.
 
 ### Dispatch rules
 

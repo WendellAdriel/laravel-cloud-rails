@@ -53,7 +53,7 @@ class WorkerTest < Minitest::Test
   end
 
   class BrokenJob < ActiveJob::Base
-    def perform
+    def perform(*)
       raise ArgumentError, "boom"
     end
   end
@@ -183,21 +183,15 @@ class WorkerTest < Minitest::Test
     assert_empty @events.emitted
   end
 
-  def test_large_failed_payloads_are_trimmed_but_keep_their_identity
-    BrokenJob.perform_later
-
-    message = @sqs.pending.sole
-    payload = JSON.parse(message.body)
-    payload["data"]["arguments"] = ["x" * 10_000]
-    message.body = JSON.generate(payload)
+  def test_a_failed_job_carries_its_message_body_whole
+    BrokenJob.perform_later(["x" * 50_000])
+    body = @sqs.pending.sole.body
 
     work_off
 
-    trimmed = JSON.parse(@events.failed_jobs.sole["payload"])
-    assert_equal payload["uuid"], trimmed["uuid"]
-    assert_equal "WorkerTest::BrokenJob", trimmed["displayName"]
-    assert trimmed["data_truncated"]
-    assert_operator @events.failed_jobs.sole.to_json.bytesize, :<, 16_384
+    # Exactly what sat on SQS, however large: Laravel Cloud stores it and
+    # pushes it back verbatim to retry the job, as FailedJobProvider::log does.
+    assert_equal body, @events.failed_jobs.sole["payload"]
   end
 
   def test_polls_the_requested_queues_in_turn
