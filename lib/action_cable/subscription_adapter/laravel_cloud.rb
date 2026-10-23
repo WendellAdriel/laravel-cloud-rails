@@ -1,18 +1,23 @@
+require "action_cable/subscription_adapter/base"
+
 module ActionCable
   module SubscriptionAdapter
     class LaravelCloud < Base
       def broadcast(channel, payload)
-        ::LaravelCloud::Websockets.broadcast(channel, payload)
+        ::LaravelCloud::Websockets.publish(::LaravelCloud::Websockets.channel(channel), "cloud-broadcast", payload)
       end
 
-      def subscribe(*)
-        raise ::LaravelCloud::Websockets::UnsupportedFeature, "Native WebSocket connections bypass the Cloud bridge"
+      def subscribe(channel, callback, success_callback = nil)
+        runtime = ::LaravelCloud::Websockets.runtime
+        runtime.subscribe(channel, callback, success_callback)
       end
 
-      def unsubscribe(*)
+      def unsubscribe(channel, callback)
+        ::LaravelCloud::Websockets.runtime.unsubscribe(channel, callback)
       end
 
       def shutdown
+        ::LaravelCloud::Websockets.runtime.stop
       end
     end
   end

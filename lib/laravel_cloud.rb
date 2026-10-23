@@ -27,5 +27,4 @@ require_relative "laravel_cloud/events"
 require_relative "laravel_cloud/queue"
 require_relative "active_job/queue_adapters/cloud_adapter"
 
-
 require_relative "laravel_cloud/websockets" if defined?(Rails::Railtie)
