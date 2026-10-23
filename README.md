@@ -291,9 +291,10 @@ end
 
 #### Retained stream messages
 
-When AnyCable already has Redis connection settings, the bridge reuses them for
-bounded stream history. This includes an existing Redis broadcast connection,
-`config/anycable.yml`, `ANYCABLE_REDIS_URL`, and Cloud's injected `REDIS_URL`.
+Cloud's injected `REDIS_URL` enables bounded stream history, including applications
+using only AnyCable's JavaScript client. When AnyCable's Ruby extension already
+has Redis connection settings, the bridge reuses them. This includes an existing
+Redis broadcast connection, `config/anycable.yml`, and `ANYCABLE_REDIS_URL`.
 Laravel Valkey uses the same Redis protocol and connection URL. The gem installs
 the Redis client dependency, so no additional bridge initializer or application
 dependency is needed.

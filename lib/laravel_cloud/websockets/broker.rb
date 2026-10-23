@@ -23,7 +23,14 @@ module LaravelCloud
       LUA
 
       def self.resolve
-        return unless defined?(::AnyCable)
+        unless defined?(::AnyCable)
+          url = ENV["REDIS_URL"]
+          return if url.to_s.empty?
+          require "redis"
+          options = { url: url }
+          options[:ssl_params] = { verify_mode: OpenSSL::SSL::VERIFY_PEER } if url.start_with?("rediss://")
+          return new(::Redis.new(**options))
+        end
         if ::AnyCable.instance_variable_defined?(:@broadcast_adapter)
           adapter = ::AnyCable.broadcast_adapter
           return new(adapter.redis_conn) if adapter.respond_to?(:redis_conn)
