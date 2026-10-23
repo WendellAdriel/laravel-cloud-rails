@@ -197,8 +197,9 @@ end
 
 Connection authentication still belongs in `ApplicationCable::Connection#connect`.
 The bridge calls your connection and channel code, including subscription
-rejections. Bridge commands use same-origin HTTP requests and require Rails
-session cookies.
+rejections, lifecycle callbacks, and periodic transmissions. Bridge commands
+use same-origin HTTP requests and a signed HttpOnly cookie issued by the gem.
+Your existing Rails session cookies remain available to connection authentication.
 
 Keep your existing Action Cable client. With the standard `@rails/actioncable`
 package loaded by your application, a subscription looks like this:
@@ -231,7 +232,10 @@ Broadcast from your existing controllers or jobs:
 ActionCable.server.broadcast("room:demo", { text: "Your report is ready" })
 ```
 
-Subscribers to `room:demo` receive the message through a private Pusher channel.
+Rails receives the stream through a private Pusher channel, applies channel
+callbacks and coders, and forwards each subscriber's frames through a separate
+private channel. `stream_for`, model broadcasts, and Turbo Streams use the same
+adapter. Existing channel prefixes are preserved.
 
 ### AnyCable clients
 
@@ -250,7 +254,28 @@ room.on('message', (message) => {
 
 After the subscription connects, call `room.perform('speak', { text: 'Hello' })`.
 Applications using `anycable-rails-core` may also keep `state_attr_accessor` in
-their channels.
+their channels. Channels using `stream_from "room:demo", whisper: true` can
+receive `room.whisper(...)` through the AnyCable Ruby extension.
+
+### Connections and recovery
+
+The gem routes commands to the Rails process that owns the connection through
+the WebSocket backend. Multiple Puma workers and application replicas use the
+same six variables. No separate Redis connection is required by the bridge.
+
+Shared worker heartbeats keep browser clients connected. Each browser connection
+renews its server lease every 30 seconds; inactive connections expire after
+90 seconds. When Rails or the backend restarts, the standard clients reconnect
+and subscribe again.
+
+`remote_connections.where(...).disconnect` uses Rails' existing connection
+identifiers. Call it when logging out a user or revoking access to stop future
+delivery to their connection.
+
+The HTML transport loads before application scripts and uses the page's CSP
+nonce. The gem adds the managed WebSocket origin to `connect-src`. Clients in
+Web Workers or other contexts without HTML use Rails' native `/cable` transport
+and the same Cloud broadcast adapter.
 
 ### Local development
 
