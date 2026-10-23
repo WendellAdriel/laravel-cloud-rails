@@ -59,7 +59,7 @@ module LaravelCloud
 
     def self.owner(request)
       value = Rack::Utils.parse_cookies_header(request.get_header("HTTP_COOKIE").to_s)["__laravel_cloud_owner"]
-      return unless value&.match?(/\A[0-9a-f]{48}\.[0-9a-f]{64}\z/)
+      return unless value.is_a?(String) && value.ascii_only? && value.match?(/\A[0-9a-f]{48}\.[0-9a-f]{64}\z/)
       nonce, signature = value.split(".")
       expected = OpenSSL::HMAC.hexdigest("SHA256", ENV.fetch("PUSHER_APP_SECRET"), "roc-owner:#{nonce}")
       nonce if ActiveSupport::SecurityUtils.secure_compare(expected, signature)
@@ -81,16 +81,26 @@ module LaravelCloud
       end
     end
 
+    module WhisperStreams
+      def stream_from(broadcasting, callback = nil, **options, &block)
+        self.whisper_stream = broadcasting.to_s if options[:whisper] && respond_to?(:whisper_stream=)
+        super
+      end
+    end
+
     class Railtie < Rails::Railtie
-      initializer "laravel_cloud.websockets" do |app|
+      initializer "laravel_cloud.websockets", after: "action_cable.set_configs", before: "anycable.disable_action_cable_mount" do |app|
         if Websockets.enabled?
           Websockets.settings
+          ActionCable.server.config.cable = (ActionCable.server.config.cable || {}).merge("adapter" => "laravel_cloud")
           app.middleware.use(Middleware)
         end
       end
 
       config.after_initialize do
-        ActionCable.server.config.cable = { "adapter" => "laravel_cloud" } if Websockets.enabled?
+        if Websockets.enabled?
+          ActionCable::Channel::Base.prepend(WhisperStreams)
+        end
       end
     end
   end

@@ -8,6 +8,7 @@ module LaravelCloud
         @subscriptions = {}
         @joined = {}
         @closed = false
+        @last_received = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         @executor = Concurrent::ThreadPoolExecutor.new(min_threads: 1, max_threads: 8, max_queue: 1024, fallback_policy: :abort)
         @thread = Thread.new { run }
         @thread.name = "rails-on-cloud-reverb"
@@ -49,6 +50,13 @@ module LaravelCloud
         end
       end
 
+      def ping
+        @monitor.synchronize do
+          raise Unavailable, "Backend heartbeat timed out" if @closed || Process.clock_gettime(Process::CLOCK_MONOTONIC) - @last_received > 12
+          send_event(event: "pusher:ping", data: {})
+        end
+      end
+
       def close
         @monitor.synchronize do
           return if @closed
@@ -81,9 +89,11 @@ module LaravelCloud
           tls = OpenSSL::SSL::SSLSocket.new(tcp, context)
           tls.hostname = config[:host]
           tls.sync_close = true
-          tls.connect
-          tls.post_connection_check(config[:host])
           @socket = tls
+          Timeout.timeout(3, Unavailable, "Backend TLS handshake timed out") do
+            tls.connect
+            tls.post_connection_check(config[:host])
+          end
         end
         @driver = WebSocket::Driver.client(self, max_length: 1_000_000)
         @driver.on(:message) { |event| receive(JSON.parse(event.data)) }
@@ -106,6 +116,7 @@ module LaravelCloud
       end
 
       def receive(frame)
+        @last_received = Process.clock_gettime(Process::CLOCK_MONOTONIC)
         data = frame["data"].is_a?(String) ? JSON.parse(frame["data"]) : frame["data"]
         case frame["event"]
         when "pusher:connection_established"

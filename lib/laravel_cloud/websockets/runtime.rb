@@ -74,6 +74,12 @@ module LaravelCloud
           when "disconnect"
             close(reason: "client_disconnect", reconnect: false)
           when "lease"
+          when "whisper"
+            subscription = @connection.subscriptions.send(:find, payload)
+            unless subscription.respond_to?(:whisper_stream) && subscription.whisper_stream
+              return [403, { error: "Whispering is not authorized" }]
+            end
+            @connection.handle_channel_command(payload.except("token", "request_id"))
           else
             @connection.handle_channel_command(payload.except("token", "request_id"))
           end
@@ -92,8 +98,11 @@ module LaravelCloud
           rescue Unavailable
           ensure
             @closed = true
-            @connection.send(:handle_close)
-            @runtime.remove(@token)
+            begin
+              @connection.send(:handle_close)
+            ensure
+              @runtime.remove(@token)
+            end
           end
         end
       end
@@ -166,6 +175,9 @@ module LaravelCloud
         rescue StandardError => error
           ActionCable.server.logger.error("rails-on-cloud cleanup failed (#{error.class})")
         end
+        ActionCable.server.connections.dup.each do |connection|
+          connection.close(reason: "server_restart") unless connection.is_a?(ConnectionTransport)
+        end
         @bus.close
       end
 
@@ -221,6 +233,7 @@ module LaravelCloud
       end
 
       def pulse
+        @bus.ping
         sessions = @lock.synchronize { @sessions.values.dup }
         return if sessions.empty?
         cutoff = Process.clock_gettime(Process::CLOCK_MONOTONIC) - 90

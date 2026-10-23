@@ -2,6 +2,7 @@ require "test_helper"
 require "rails"
 require "rack/mock"
 require_relative "../lib/laravel_cloud/websockets"
+require_relative "../lib/action_cable/subscription_adapter/laravel_cloud"
 
 class WebsocketsTest < Minitest::Test
   VARIABLES = LaravelCloud::Websockets::VARIABLES
@@ -13,6 +14,22 @@ class WebsocketsTest < Minitest::Test
 
   def teardown
     @environment.each { |key, value| value ? ENV[key] = value : ENV.delete(key) }
+  end
+
+  def test_existing_csp_adds_only_the_managed_socket_origin
+    policy = ActionDispatch::ContentSecurityPolicy.new do |value|
+      value.default_src :self
+      value.script_src :self
+      value.connect_src :self
+    end
+    original = policy.directives.deep_dup
+    app = LaravelCloud::Websockets::Middleware.new(->(_env) { [200, { "content-type" => "text/html" }, ["<head></head><body>hello</body>"]] })
+    mock = Rack::MockRequest.new(ActionDispatch::ContentSecurityPolicy::Middleware.new(app))
+    response = mock.get("/", "action_dispatch.content_security_policy" => policy)
+    assert_includes response["content-security-policy"], "connect-src 'self' ws://localhost:8080"
+    assert_equal original, policy.directives
+    assert_equal "private, no-store", response["cache-control"]
+    refute_includes response["content-security-policy"], "unsafe-inline"
   end
 
   def test_activation_requires_all_six_variables
@@ -99,10 +116,70 @@ class WebsocketsTest < Minitest::Test
     assert_equal 200, response.status
     assert_includes response.body, "public-key"
     refute_includes response.body, "private-secret"
-    assert_equal "no-store", response["cache-control"]
+    assert_equal "private, no-store", response["cache-control"]
+  end
+
+  def test_a_stalled_backend_tls_handshake_is_bounded
+    listener = TCPServer.new("127.0.0.1", 0)
+    ENV["PUSHER_PORT"] = listener.addr[1].to_s
+    ENV["PUSHER_HOST"] = "127.0.0.1"
+    ENV["PUSHER_SCHEME"] = "https"
+    release = ::Queue.new
+    failures = ::Queue.new
+    old_logger = ActionCable.server.config.logger
+    ActionCable.server.config.logger = Logger.new(File::NULL)
+    peer = Thread.new do
+      socket = listener.accept
+      release.pop
+      socket.close
+    end
+    started = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    bus = LaravelCloud::Websockets::Bus.new { failures << true }
+    assert_raises(LaravelCloud::Websockets::Unavailable) { bus.subscribe("private-test", ->(*) {}) }
+    assert_operator Process.clock_gettime(Process::CLOCK_MONOTONIC) - started, :<, 4.5
+    assert failures.pop(timeout: 1)
+  ensure
+    bus&.close
+    release&.push(true)
+    listener&.close
+    peer&.join(2)
+    ActionCable.server.config.logger = old_logger
   end
 
   def test_publish_signs_the_actual_http_request
+    request_line, body = capture_publish do
+      LaravelCloud::Websockets.publish("private-room", "cloud-frame", { text: "hello" })
+    end
+    uri = URI.parse(request_line.split[1])
+    query = URI.decode_www_form(uri.query).to_h
+    signature = query.delete("auth_signature")
+    assert_equal Digest::MD5.hexdigest(body), query["body_md5"]
+    expected = OpenSSL::HMAC.hexdigest("SHA256", "private-secret", "POST\n#{uri.path}\n#{URI.encode_www_form(query.sort)}")
+    assert_equal expected, signature
+    assert_equal({ "text" => "hello" }, JSON.parse(JSON.parse(body).fetch("data")))
+  end
+
+  def test_subscription_adapter_preserves_the_application_channel_prefix
+    config = ActionCable::Server::Configuration.new
+    config.cable = { channel_prefix: "my-application" }
+    server = ActionCable::Server::Base.new(config: config)
+    adapter = ActionCable::SubscriptionAdapter::LaravelCloud.new(server)
+    _, body = capture_publish { adapter.broadcast("room", JSON.generate(text: "hello")) }
+    assert_equal [LaravelCloud::Websockets.channel("my-application:room")], JSON.parse(body).fetch("channels")
+  end
+
+  def test_backend_http_errors_are_reported_to_the_publisher
+    capture_publish(status: 401) do
+      error = assert_raises(LaravelCloud::Websockets::Unavailable) do
+        LaravelCloud::Websockets.publish("private-room", "cloud-frame", { text: "hello" })
+      end
+      assert_match(/HTTP 401/, error.message)
+    end
+  end
+
+  private
+
+  def capture_publish(status: 200)
     listener = TCPServer.new("127.0.0.1", 0)
     ENV["PUSHER_PORT"] = listener.addr[1].to_s
     ENV["PUSHER_HOST"] = "127.0.0.1"
@@ -117,18 +194,11 @@ class WebsocketsTest < Minitest::Test
       end
       body = socket.read(headers.fetch("content-length").to_i)
       captured << [request_line, body]
-      socket.write("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+      socket.write("HTTP/1.1 #{status} Response\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
       socket.close
     end
-    LaravelCloud::Websockets.publish("private-room", "cloud-frame", { text: "hello" })
-    request_line, body = captured.pop(timeout: 2)
-    uri = URI.parse(request_line.split[1])
-    query = URI.decode_www_form(uri.query).to_h
-    signature = query.delete("auth_signature")
-    assert_equal Digest::MD5.hexdigest(body), query["body_md5"]
-    expected = OpenSSL::HMAC.hexdigest("SHA256", "private-secret", "POST\n#{uri.path}\n#{URI.encode_www_form(query.sort)}")
-    assert_equal expected, signature
-    assert_equal({ "text" => "hello" }, JSON.parse(JSON.parse(body).fetch("data")))
+    yield
+    captured.pop(timeout: 2)
   ensure
     listener&.close
     thread&.join(2)

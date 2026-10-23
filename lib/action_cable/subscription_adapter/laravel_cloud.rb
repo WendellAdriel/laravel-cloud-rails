@@ -1,23 +1,35 @@
 require "action_cable/subscription_adapter/base"
+require "action_cable/subscription_adapter/channel_prefix"
 
 module ActionCable
   module SubscriptionAdapter
     class LaravelCloud < Base
+      prepend ChannelPrefix
+
+      def initialize(server)
+        super
+        @bindings = {}
+        @bindings_lock = Mutex.new
+      end
+
       def broadcast(channel, payload)
         ::LaravelCloud::Websockets.publish(::LaravelCloud::Websockets.channel(channel), "cloud-broadcast", payload)
       end
 
       def subscribe(channel, callback, success_callback = nil)
         runtime = ::LaravelCloud::Websockets.runtime
+        @bindings_lock.synchronize { @bindings[[channel, callback]] = runtime }
         runtime.subscribe(channel, callback, success_callback)
       end
 
       def unsubscribe(channel, callback)
-        ::LaravelCloud::Websockets.runtime.unsubscribe(channel, callback)
+        runtime = @bindings_lock.synchronize { @bindings.delete([channel, callback]) }
+        runtime&.unsubscribe(channel, callback)
       end
 
       def shutdown
-        ::LaravelCloud::Websockets.runtime.stop
+        runtimes = @bindings_lock.synchronize { @bindings.values.uniq }
+        runtimes.each(&:stop)
       end
     end
   end

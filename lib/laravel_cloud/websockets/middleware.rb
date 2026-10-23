@@ -2,7 +2,7 @@ module LaravelCloud
   module Websockets
     class Middleware
       ENDPOINT = "/__laravel_cloud/cable"
-      COMMANDS = %w[connect ready lease disconnect subscribe unsubscribe message].freeze
+      COMMANDS = %w[connect ready lease disconnect subscribe unsubscribe message whisper].freeze
 
       def initialize(app)
         @app = app
@@ -17,6 +17,7 @@ module LaravelCloud
 
         status, headers, body = @app.call(environment)
         return [status, headers, body] unless status == 200 && headers["content-type"].to_s.include?("text/html") && !headers["content-encoding"]
+        allow_backend(request)
         nonce = request.content_security_policy_nonce
         tag = "<script src=\"#{ENDPOINT}.js\"#{nonce ? " nonce=\"#{ERB::Util.html_escape(nonce)}\"" : ''}></script>"
         with_owner(request, [status, headers.except("content-length", "etag"), HtmlBody.new(body, tag)])
@@ -35,8 +36,9 @@ module LaravelCloud
         unless payload["command"] == "connect"
           raise InvalidCommand, "Request ID required" unless payload["request_id"].is_a?(String) && payload["request_id"].bytesize.between?(1, 64)
         end
-        if %w[subscribe unsubscribe message].include?(payload["command"])
+        if %w[subscribe unsubscribe message whisper].include?(payload["command"])
           raise InvalidCommand, "Invalid identifier" unless payload["identifier"].is_a?(String) && JSON.parse(payload["identifier"]).is_a?(Hash)
+          raise InvalidCommand, "Invalid whisper" if payload["command"] == "whisper" && !payload["data"].is_a?(Hash) && !payload["data"].is_a?(String)
           raise InvalidCommand, "Invalid message" if payload["command"] == "message" && (!payload["data"].is_a?(String) || !JSON.parse(payload["data"]).is_a?(Hash))
         end
         return json(401, error: "Connection cookie required") unless Websockets.owner(request)
@@ -48,8 +50,20 @@ module LaravelCloud
         json(503, error: "WebSocket backend unavailable")
       end
 
+      def allow_backend(request)
+        policy = request.content_security_policy
+        return unless policy
+        policy = policy.dup
+        sources = policy.directives["connect-src"] || policy.directives["default-src"] || ["'self'"]
+        config = Websockets.settings
+        origin = "#{config[:scheme] == 'https' ? 'wss' : 'ws'}://#{config[:host]}:#{config[:port]}"
+        policy.connect_src(*(sources + [origin]).uniq)
+        request.content_security_policy = policy
+      end
+
       def with_owner(request, response)
         unless Websockets.owner(request)
+          response[1]["cache-control"] = "private, no-store"
           Rack::Utils.set_cookie_header!(response[1], "__laravel_cloud_owner", value: Websockets.owner_cookie, path: "/", httponly: true, same_site: :lax, secure: request.ssl?)
         end
         response
