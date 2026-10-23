@@ -20,4 +20,5 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "activejob", ">= 7.1"
   spec.add_dependency "aws-sdk-sqs", "~> 1.80"
+  spec.add_dependency "redis", ">= 4.8", "< 6"
 end

@@ -38,9 +38,14 @@ module LaravelCloud
       "#{ENV.fetch('PUSHER_APP_KEY')}:#{signature}"
     end
 
-    def self.publish(channel, event, data)
+    def self.event_body(channel, event, data)
       body = JSON.generate(name: event, channels: [channel], data: JSON.generate(data))
       raise InvalidCommand, "Message exceeds the backend payload limit" if body.bytesize > 9500
+      body
+    end
+
+    def self.publish(channel, event, data)
+      body = event_body(channel, event, data)
       path = "/apps/#{ENV.fetch('PUSHER_APP_ID')}/events"
       parameters = { "auth_key" => ENV.fetch("PUSHER_APP_KEY"), "auth_timestamp" => Time.now.to_i.to_s, "auth_version" => "1.0", "body_md5" => Digest::MD5.hexdigest(body) }
       query = URI.encode_www_form(parameters.sort)
