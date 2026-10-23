@@ -2,6 +2,14 @@
 
 Laravel Cloud features for Ruby on Rails applications.
 
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Features](#features)
+- [Managed Queues](#managed-queues)
+- [WebSockets](#websockets)
+- [Development](#development)
+- [License](#license)
+
 ## Requirements
 
 - Ruby 3.2+
@@ -20,6 +28,7 @@ bundle add rails-on-cloud --git https://github.com/laravel/rails-on-cloud.git
 | Feature | Summary |
 | --- | --- |
 | [Managed Queues](#managed-queues) | Laravel Cloud managed queues as an Active Job backend. |
+| [WebSockets](#websockets) | Action Cable and AnyCable bridge to Laravel Cloud managed WebSockets. |
 
 ---
 
@@ -140,6 +149,117 @@ config.active_job.queue_adapter = :async
 | `ActiveJob::EnqueueError` | The job couldn't be sent to the queue. `perform_later` returns `false`, as with any adapter. |
 
 ---
+
+## WebSockets
+
+Use existing Action Cable channels and browser clients with a Pusher-compatible
+WebSocket backend. The gem runs channel actions in Rails and sends broadcasts
+through the backend. You can keep the AnyCable browser client and Rails channel
+state accessors.
+
+### Setup
+
+Attach a managed WebSocket resource to your Laravel Cloud environment. Cloud
+provides the connection settings through these environment variables:
+
+| Variable | Value |
+| --- | --- |
+| `PUSHER_APP_ID` | WebSocket application ID. |
+| `PUSHER_APP_KEY` | Public application key. |
+| `PUSHER_APP_SECRET` | Application secret used to sign requests. |
+| `PUSHER_HOST` | WebSocket server hostname. |
+| `PUSHER_PORT` | WebSocket server port. |
+| `PUSHER_SCHEME` | `http` or `https`. |
+
+When all six variables are nonempty, the gem selects its Action Cable adapter
+and injects its browser transport into your HTML pages. No bridge initializer,
+changes to `config/cable.yml`, or Pusher JavaScript dependency are needed.
+The application secret stays on the server.
+
+### Action Cable channels
+
+Use your existing [Action Cable](https://guides.rubyonrails.org/v8.1/action_cable_overview.html)
+channel APIs. For example, this channel accepts subscriptions to a demo room:
+
+```ruby
+class RoomChannel < ApplicationCable::Channel
+  def subscribed
+    return reject unless params[:room] == "demo"
+
+    stream_from "room:demo"
+  end
+
+  def speak(data)
+    ActionCable.server.broadcast("room:demo", { text: data.fetch("text") })
+  end
+end
+```
+
+Connection authentication still belongs in `ApplicationCable::Connection#connect`.
+The bridge calls your connection and channel code, including subscription
+rejections. Bridge commands use same-origin HTTP requests and require Rails
+session cookies.
+
+Keep your existing Action Cable client. With the standard `@rails/actioncable`
+package loaded by your application, a subscription looks like this:
+
+```js
+import { createConsumer } from '@rails/actioncable';
+
+const consumer = createConsumer();
+const room = consumer.subscriptions.create(
+    { channel: 'RoomChannel', room: 'demo' },
+    {
+        received(message) {
+            console.log(message.text);
+        },
+    },
+);
+```
+
+After the subscription connects, call channel actions as usual:
+
+```js
+room.perform('speak', { text: 'Hello from Action Cable' });
+```
+
+### Broadcasting
+
+Broadcast from your existing controllers or jobs:
+
+```ruby
+ActionCable.server.broadcast("room:demo", { text: "Your report is ready" })
+```
+
+Subscribers to `room:demo` receive the message through a private Pusher channel.
+
+### AnyCable clients
+
+If your application already uses `@anycable/web`, keep its client API:
+
+```js
+import { createCable } from '@anycable/web';
+
+const consumer = createCable();
+const room = consumer.subscribeTo('RoomChannel', { room: 'demo' });
+
+room.on('message', (message) => {
+    console.log(message.text);
+});
+```
+
+After the subscription connects, call `room.perform('speak', { text: 'Hello' })`.
+Applications using `anycable-rails-core` may also keep `state_attr_accessor` in
+their channels.
+
+### Local development
+
+Without all six `PUSHER_*` variables, the bridge stays disabled and your existing
+Action Cable adapter remains in use.
+
+To exercise the bridge locally, provide all six variables for a Pusher-compatible
+server. `PUSHER_HOST` and `PUSHER_PORT` must be reachable from both Rails and the
+browser.
 
 ## Development
 
