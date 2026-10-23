@@ -257,11 +257,65 @@ Applications using `anycable-rails-core` may also keep `state_attr_accessor` in
 their channels. Channels using `stream_from "room:demo", whisper: true` can
 receive `room.whisper(...)` through the AnyCable Ruby extension.
 
+#### Extended protocol and presence
+
+Applications using AnyCable's extended protocol can keep the same client options:
+
+```js
+const consumer = createCable({ protocol: 'actioncable-v1-ext-json' });
+const room = consumer.subscribeTo('RoomChannel', { room: 'demo' });
+
+room.on('connect', async () => {
+    await room.presence.join('user-42', { name: 'Taylor' });
+    console.log(await room.presence.info());
+});
+```
+
+The bridge translates presence commands to Reverb's presence channels. Multiple
+connections with the same presence ID appear as one member. Unsubscribe, logout,
+and access revocation remove the connection's membership. Presence does not
+require a separate cache.
+
+Keep the standard AnyCable presence concern when managing membership in Ruby:
+
+```ruby
+class PresenceChannel < ApplicationCable::Channel
+  include AnyCable::Rails::Channel::Presence
+
+  def subscribed
+    stream_from "room:demo"
+    join_presence(id: current_user.id, info: { name: current_user.name })
+  end
+end
+```
+
+#### Retained stream messages
+
+When AnyCable already has Redis connection settings, the bridge reuses them for
+bounded stream history. This includes an existing Redis broadcast connection,
+`config/anycable.yml`, `ANYCABLE_REDIS_URL`, and Cloud's injected `REDIS_URL`.
+Laravel Valkey uses the same Redis protocol and connection URL. The gem installs
+the Redis client dependency, so no additional bridge initializer or application
+dependency is needed.
+
+Reverb carries live messages. The optional cache retains up to 100 messages per
+stream, with a five-minute expiry renewed on publication. Extended clients can
+catch up after disconnects, Rails worker loss, or Reverb restarts while those
+messages remain in the cache. Reconnection authenticates and subscribes again.
+Explicitly configured AnyCable TLS and Sentinel settings are preserved. New
+cache connections verify TLS certificates by default.
+
+If history is unavailable, the channel emits an `info` event whose `type` is
+`history_not_found`. Handle that event by loading current application state
+through your application's API. The bridge rejects unavailable history instead
+of confirming an incomplete replay. Without an existing cache connection,
+extended clients still have live messages and presence.
+
 ### Connections and recovery
 
 The gem routes commands to the Rails process that owns the connection through
 the WebSocket backend. Multiple Puma workers and application replicas use the
-same six variables. No separate Redis connection is required by the bridge.
+same six variables for live delivery and presence.
 
 Shared worker heartbeats keep browser clients connected. Each browser connection
 renews its server lease every 30 seconds; inactive connections expire after
@@ -275,7 +329,7 @@ delivery to their connection.
 The HTML transport loads before application scripts and uses the page's CSP
 nonce. The gem adds the managed WebSocket origin to `connect-src`. Clients in
 Web Workers or other contexts without HTML use Rails' native `/cable` transport
-and the same Cloud broadcast adapter.
+with the standard Action Cable JSON protocol and the same Cloud broadcast adapter.
 
 ### Local development
 
