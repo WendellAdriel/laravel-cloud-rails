@@ -273,7 +273,13 @@ module LaravelCloud
               if same_epoch && data.fetch("offset") == cursor.fetch("offset", 0) + 1
                 callback.call(StreamMessage.new(data))
                 cursor = data.slice("epoch", "offset")
-              elsif !same_epoch || data.fetch("offset") > cursor.fetch("offset", 0)
+              elsif !same_epoch
+                state = broker.snapshot(stream)
+                if state.fetch("epoch") == data.fetch("epoch")
+                  cursor = { "epoch" => data.fetch("epoch"), "offset" => 0 }
+                  drain.call
+                end
+              elsif data.fetch("offset") > cursor.fetch("offset", 0)
                 drain.call
               end
             end
