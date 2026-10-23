@@ -332,6 +332,10 @@ nonce. The gem adds the managed WebSocket origin to `connect-src`. Clients in
 Web Workers or other contexts without HTML use Rails' native `/cable` transport
 with the standard Action Cable JSON protocol and the same Cloud broadcast adapter.
 
+When `APP_URL` is available, server-side WebSocket connections send its origin.
+Cloud supplies this variable automatically, allowing the WebSocket application
+to restrict connections to your application origin.
+
 ### Local development
 
 Without all six `PUSHER_*` variables, the bridge stays disabled and your existing

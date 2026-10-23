@@ -82,6 +82,13 @@ module LaravelCloud
         end
       end
 
+      def application_origin
+        uri = URI.parse(ENV["APP_URL"].to_s)
+        return unless uri.is_a?(URI::HTTP) && uri.host
+        port = uri.port unless uri.port == uri.default_port
+        URI::Generic.build(scheme: uri.scheme, host: uri.host, port: port).to_s
+      end
+
       def run
         config = Websockets.settings
         tcp = Socket.tcp(config[:host], config[:port], connect_timeout: 3)
@@ -99,6 +106,8 @@ module LaravelCloud
           end
         end
         @driver = WebSocket::Driver.client(self, max_length: 1_000_000)
+        origin = application_origin
+        @driver.set_header("Origin", origin) if origin
         @driver.on(:message) { |event| receive(JSON.parse(event.data)) }
         @driver.on(:error) { |event| raise Unavailable, event.message }
         @driver.on(:close) { raise Unavailable, "Backend WebSocket closed" }

@@ -8,7 +8,8 @@ class WebsocketsTest < Minitest::Test
   VARIABLES = LaravelCloud::Websockets::VARIABLES
 
   def setup
-    @environment = VARIABLES.to_h { |name| [name, ENV[name]] }
+    @environment = (VARIABLES + ["APP_URL"]).to_h { |name| [name, ENV[name]] }
+    ENV.delete("APP_URL")
     ENV.update("PUSHER_APP_ID" => "example", "PUSHER_APP_KEY" => "public-key", "PUSHER_APP_SECRET" => "private-secret", "PUSHER_HOST" => "localhost", "PUSHER_PORT" => "8080", "PUSHER_SCHEME" => "http")
   end
 
@@ -161,6 +162,21 @@ class WebsocketsTest < Minitest::Test
     ActionCable.server.config.logger = old_logger
   end
 
+  def test_backend_handshake_sends_only_the_application_origin
+    {
+      "https://app.example/path" => "https://app.example",
+      "https://ignored:ignored@app.example:8443/nested?ignored=true#fragment" => "https://app.example:8443"
+    }.each do |url, origin|
+      ENV["APP_URL"] = url
+      assert_equal origin, capture_bus_handshake["origin"]
+    end
+  end
+
+  def test_backend_handshake_does_not_require_an_application_url
+    headers = capture_bus_handshake
+    refute headers.key?("origin")
+  end
+
   def test_publish_signs_the_actual_http_request
     request_line, body = capture_publish do
       LaravelCloud::Websockets.publish("private-room", "cloud-frame", { text: "hello" })
@@ -193,6 +209,33 @@ class WebsocketsTest < Minitest::Test
   end
 
   private
+
+  def capture_bus_handshake
+    listener = TCPServer.new("127.0.0.1", 0)
+    ENV["PUSHER_PORT"] = listener.addr[1].to_s
+    ENV["PUSHER_HOST"] = "127.0.0.1"
+    captured = ::Queue.new
+    old_logger = ActionCable.server.config.logger
+    ActionCable.server.config.logger = Logger.new(File::NULL)
+    peer = Thread.new do
+      socket = listener.accept
+      socket.gets
+      headers = {}
+      while (line = socket.gets) && line != "\r\n"
+        key, value = line.split(":", 2)
+        headers[key.downcase] = value.strip
+      end
+      captured << headers
+      socket.close
+    end
+    bus = LaravelCloud::Websockets::Bus.new {}
+    captured.pop(timeout: 2)
+  ensure
+    bus&.close
+    listener&.close
+    peer&.join(2)
+    ActionCable.server.config.logger = old_logger
+  end
 
   def capture_publish(status: 200)
     listener = TCPServer.new("127.0.0.1", 0)
