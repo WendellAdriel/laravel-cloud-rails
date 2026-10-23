@@ -49,6 +49,14 @@ class WebsocketsTest < Minitest::Test
     refute_equal signature, LaravelCloud::Websockets.authorize("1.2", "private-other")
   end
 
+  def test_presence_authorization_covers_the_exact_membership_data
+    data = JSON.generate(user_id: "member", user_info: { name: "Member" })
+    signature = LaravelCloud::Websockets.authorize("1.2", "presence-room", data)
+    expected = OpenSSL::HMAC.hexdigest("SHA256", "private-secret", "1.2:presence-room:#{data}")
+    assert_equal "public-key:#{expected}", signature
+    refute_equal signature, LaravelCloud::Websockets.authorize("1.2", "presence-room", data + " ")
+  end
+
   def test_invalid_scheme_and_port_fail_before_connecting
     ENV["PUSHER_SCHEME"] = "file"
     assert_raises(LaravelCloud::Websockets::Error) { LaravelCloud::Websockets.settings }
@@ -66,6 +74,13 @@ class WebsocketsTest < Minitest::Test
     assert_equal 413, mock.post("/__laravel_cloud/cable", **headers, input: "x" * 9000).status
     ["null", "[]", "{", '{"command":"unknown"}', '{"command":"message","request_id":"a","identifier":"[]","data":"{}"}'].each do |input|
       assert_equal 400, mock.post("/__laravel_cloud/cable", **headers, input: input).status
+    end
+    [
+      { command: "join", request_id: "a", identifier: '{"channel":"RoomChannel"}', presence: { id: 1 } },
+      { command: "history", request_id: "a", identifier: '{"channel":"RoomChannel"}', history: [] },
+      { command: "history", request_id: "a", identifier: '{"channel":"RoomChannel"}', history: { streams: { stream: { offset: -1, epoch: "a" } } } }
+    ].each do |payload|
+      assert_equal 400, mock.post("/__laravel_cloud/cable", **headers, input: JSON.generate(payload)).status
     end
   end
 

@@ -2,7 +2,7 @@ module LaravelCloud
   module Websockets
     class Middleware
       ENDPOINT = "/__laravel_cloud/cable"
-      COMMANDS = %w[connect ready lease disconnect subscribe unsubscribe message whisper].freeze
+      COMMANDS = %w[connect ready lease disconnect subscribe unsubscribe message whisper pong history join leave presence].freeze
 
       def initialize(app)
         @app = app
@@ -36,10 +36,26 @@ module LaravelCloud
         unless payload["command"] == "connect"
           raise InvalidCommand, "Request ID required" unless payload["request_id"].is_a?(String) && payload["request_id"].bytesize.between?(1, 64)
         end
-        if %w[subscribe unsubscribe message whisper].include?(payload["command"])
+        if %w[subscribe unsubscribe message whisper history join leave presence].include?(payload["command"])
           raise InvalidCommand, "Invalid identifier" unless payload["identifier"].is_a?(String) && JSON.parse(payload["identifier"]).is_a?(Hash)
           raise InvalidCommand, "Invalid whisper" if payload["command"] == "whisper" && !payload["data"].is_a?(Hash) && !payload["data"].is_a?(String)
           raise InvalidCommand, "Invalid message" if payload["command"] == "message" && (!payload["data"].is_a?(String) || !JSON.parse(payload["data"]).is_a?(Hash))
+        end
+        if payload.key?("history")
+          history = payload["history"]
+          raise InvalidCommand, "Invalid history" unless history.is_a?(Hash)
+          since = history["since"]
+          raise InvalidCommand, "Invalid history timestamp" unless since.nil? || (since.is_a?(Numeric) && since.finite? && since >= 0)
+          streams = history.fetch("streams", {})
+          raise InvalidCommand, "Invalid history positions" unless streams.is_a?(Hash) && streams.values.all? { |position| position.is_a?(Hash) && position["offset"].is_a?(Integer) && position["offset"] >= 0 && position["epoch"].is_a?(String) }
+        end
+        raise InvalidCommand, "History required" if payload["command"] == "history" && !payload.key?("history")
+        if payload["command"] == "join" || (payload["command"] == "subscribe" && payload.key?("presence"))
+          value = payload["presence"]
+          raise InvalidCommand, "Invalid presence" unless value.is_a?(Hash) && value["id"].is_a?(String) && value["id"].bytesize.between?(1, 200)
+        end
+        if payload["command"] == "presence" && payload.key?("data")
+          raise InvalidCommand, "Invalid presence request" unless payload["data"].nil? || payload["data"].is_a?(Hash)
         end
         return json(401, error: "Connection cookie required") unless Websockets.owner(request)
         status, response = Websockets.runtime.execute(payload, request)

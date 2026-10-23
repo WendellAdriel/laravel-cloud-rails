@@ -33,8 +33,9 @@ module LaravelCloud
       "private-roc-stream-#{Digest::SHA256.hexdigest(stream)}"
     end
 
-    def self.authorize(socket_id, channel)
-      signature = OpenSSL::HMAC.hexdigest("SHA256", ENV.fetch("PUSHER_APP_SECRET"), "#{socket_id}:#{channel}")
+    def self.authorize(socket_id, channel, channel_data = nil)
+      value = [socket_id, channel, channel_data].compact.join(":")
+      signature = OpenSSL::HMAC.hexdigest("SHA256", ENV.fetch("PUSHER_APP_SECRET"), value)
       "#{ENV.fetch('PUSHER_APP_KEY')}:#{signature}"
     end
 
@@ -76,6 +77,25 @@ module LaravelCloud
       "#{nonce}.#{signature}"
     end
 
+    def self.broker
+      @broker_lock ||= Mutex.new
+      @broker_lock.synchronize do
+        if @broker_pid != Process.pid
+          @broker = Broker.resolve
+          @broker_pid = Process.pid
+        end
+        @broker
+      end
+    end
+
+    def self.with_position(message)
+      previous = Thread.current[:laravel_cloud_stream_position]
+      Thread.current[:laravel_cloud_stream_position] = message.respond_to?(:position) ? message.position : nil
+      yield
+    ensure
+      Thread.current[:laravel_cloud_stream_position] = previous
+    end
+
     def self.runtime
       @runtime_lock ||= Mutex.new
       @runtime_lock.synchronize do
@@ -105,6 +125,11 @@ module LaravelCloud
       config.after_initialize do
         if Websockets.enabled?
           ActionCable::Channel::Base.prepend(WhisperStreams)
+          ActionCable::Channel::Base.prepend(StreamPositions)
+          if defined?(::AnyCable::Rails)
+            require "anycable/rails/channel/presence"
+            ::AnyCable::Rails::Channel::Presence.prepend(ChannelPresence)
+          end
         end
       end
     end
@@ -112,5 +137,7 @@ module LaravelCloud
 end
 
 require_relative "websockets/bus"
+require_relative "websockets/broker"
+require_relative "websockets/presence"
 require_relative "websockets/runtime"
 require_relative "websockets/middleware"

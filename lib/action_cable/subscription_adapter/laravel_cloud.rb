@@ -13,7 +13,9 @@ module ActionCable
       end
 
       def broadcast(channel, payload)
-        ::LaravelCloud::Websockets.publish(::LaravelCloud::Websockets.channel(channel), "cloud-broadcast", payload)
+        broker = ::LaravelCloud::Websockets.broker
+        event, data = broker ? ["cloud-stream", broker.append(channel, payload)] : ["cloud-broadcast", payload]
+        ::LaravelCloud::Websockets.publish(::LaravelCloud::Websockets.channel(channel), event, data)
       end
 
       def subscribe(channel, callback, success_callback = nil)

@@ -1,7 +1,7 @@
 module LaravelCloud
   module Websockets
     class Bus
-      def initialize(&on_failure)
+      def initialize(serial: false, &on_failure)
         @failure = on_failure
         @monitor = Monitor.new
         @changed = @monitor.new_cond
@@ -9,7 +9,7 @@ module LaravelCloud
         @joined = {}
         @closed = false
         @last_received = Process.clock_gettime(Process::CLOCK_MONOTONIC)
-        @executor = Concurrent::ThreadPoolExecutor.new(min_threads: 1, max_threads: 8, max_queue: 1024, fallback_policy: :abort)
+        @executor = Concurrent::ThreadPoolExecutor.new(min_threads: 1, max_threads: serial ? 1 : 8, max_queue: 1024, fallback_policy: :abort)
         @thread = Thread.new { run }
         @thread.name = "rails-on-cloud-reverb"
       end
@@ -24,17 +24,20 @@ module LaravelCloud
         @socket.write(bytes)
       end
 
-      def subscribe(channel, callback, success = nil)
+      def subscribe(channel, callback, success = nil, channel_data: nil)
         @monitor.synchronize do
           wait_until { @socket_id }
           if !@subscriptions.key?(channel)
             @subscriptions[channel] = []
-            send_event(event: "pusher:subscribe", data: { channel: channel, auth: Websockets.authorize(@socket_id, channel) })
+            data = { channel: channel, auth: Websockets.authorize(@socket_id, channel, channel_data) }
+            data[:channel_data] = channel_data if channel_data
+            send_event(event: "pusher:subscribe", data: data)
           end
           @subscriptions[channel] << callback
           wait_until { @joined[channel] }
         end
         success.call if success
+        @monitor.synchronize { @joined[channel] }
       end
 
       def unsubscribe(channel, callback)
@@ -123,7 +126,7 @@ module LaravelCloud
           @socket_id = data.fetch("socket_id")
           @changed.broadcast
         when "pusher_internal:subscription_succeeded"
-          @joined[frame.fetch("channel")] = true
+          @joined[frame.fetch("channel")] = data
           @changed.broadcast
         when "pusher:ping"
           send_event(event: "pusher:pong", data: {})
